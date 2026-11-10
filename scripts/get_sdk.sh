@@ -8,7 +8,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK="${RKNN3_SDK_ROOT:-$ROOT/.sdk}"
-TAG="${RKNN3_TAG:-V1.2.0}"
+# 注意 tag 大小写：airockchip/rknn3-toolkit 用的是 v1.2.0（小写 v），
+# 而 airockchip/rknn3-model-zoo 用的是 V1.2.0（大写 V）。
+TAG="${RKNN3_TAG:-v1.2.0}"
 
 if [ -d "$SDK/rknn3-runtime/rknn3-api/include" ]; then
   echo "[get_sdk] 已存在：$SDK"
