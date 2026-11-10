@@ -1,0 +1,22 @@
+# 目标平台是 Linux（板端与转换机）：所有文本统一 LF，避免脚本被 CRLF 弄坏
+* text=auto
+*.sh    text eol=lf
+*.py    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.cpp   text eol=lf
+*.cc    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.in    text eol=lf
+CMakeLists.txt text eol=lf
+LICENSE text eol=lf
+NOTICE  text eol=lf
+*.a     binary
+*.so    binary
+*.gguf  binary
+*.bin   binary
+*.rknn  binary
+*.weight binary
+.gitkeep text eol=lf

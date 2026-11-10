@@ -1,0 +1,39 @@
+# 构建产物
+server/build/
+.sdk/
+.model-zoo/
+*.o
+*.a.tmp
+
+# 模型与转换中间产物（都很大，别进 git）
+model/*.rknn
+model/*.weight
+model/*.gguf
+model/*.bin
+model/*.safetensors
+model/*.onnx
+model/*.pkl
+model/tmp/
+convert/tmp/
+**/tmp/
+
+# 运行/实验产物
+*.log
+tools/*.json
+results/
+run/
+
+# Python
+__pycache__/
+*.pyc
+.venv*/
+venv*/
+
+# 其它
+.DS_Store
+.idea/
+.vscode/
+
+# 测试产物
+results/*
+!results/.gitkeep

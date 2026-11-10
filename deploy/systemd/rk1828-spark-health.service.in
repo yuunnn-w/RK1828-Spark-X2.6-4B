@@ -1,0 +1,8 @@
+[Unit]
+Description=RK1828 Spark server health watchdog (restarts on repeated /health failure)
+After=rk1828-spark.service
+
+[Service]
+Type=oneshot
+ExecStart=__PREFIX__/rk1828-spark-health.sh
+Nice=10

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the RK1828 Spark server health check every 20s
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=20
+AccuracySec=5
+Unit=rk1828-spark-health.service
+
+[Install]
+WantedBy=timers.target

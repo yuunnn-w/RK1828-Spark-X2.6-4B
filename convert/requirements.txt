@@ -1,0 +1,13 @@
+# PC 侧转换环境（Python 3.12 实测；model-zoo 的 Spark 示例钉这三个版本）
+# 装法见 docs/build.md。rknn3-toolkit 的 wheel 不在 PyPI，从 rknn3-toolkit 仓库里装：
+#   pip install rknn3_toolkit-1.2.0-cp312-cp312-manylinux2014_x86_64.whl
+torch==2.8.0
+transformers==4.57.1
+tokenizers==0.22.2
+onnx>=1.16.0,<=1.18.0
+onnxscript
+numpy<=1.26.4
+huggingface-hub
+modelscope
+datasets
+tqdm

@@ -1,0 +1,27 @@
+[Unit]
+Description=RK1828 Spark-X2.6-4B OpenAI-compatible inference server
+Documentation=file://__PREFIX__/README.md
+After=network-online.target rknn3.service
+Wants=network-online.target
+Requires=rknn3.service
+# 卡还没就绪时反复重试直到成功（不设重试上限）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 参数集中在 __PREFIX__/rk1828-spark.env 与 __PREFIX__/start.sh，改参数不必动本单元
+ExecStart=__PREFIX__/start.sh
+Restart=always
+RestartSec=8
+# SIGTERM -> 停止 accept -> 等活跃连接结束 -> 销毁 session/context（绝不把脏 session 留在卡上）
+KillSignal=SIGTERM
+TimeoutStopSec=90
+SendSIGHUP=no
+LimitNOFILE=8192
+WorkingDirectory=__PREFIX__
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rk1828-spark
+
+[Install]
+WantedBy=multi-user.target

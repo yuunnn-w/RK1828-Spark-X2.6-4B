@@ -1,0 +1,43 @@
+Third-Party Components and Notices
+==================================
+
+本仓库的原创代码（server/cpp、scripts、convert、tools、deploy、docs）以 GPL-3.0 授权，
+见 LICENSE。以下是随带的第三方部件，它们的授权**不**被 GPL 覆盖，请各自遵守：
+
+1. server/thirdparty/json/  —— nlohmann/json
+   - 许可证：MIT（副本见 server/thirdparty/json/LICENSE.MIT）
+   - 来源：airockchip/rknn3-model-zoo 的 3rdparty/json（该仓库整体为 Apache-2.0）
+
+2. server/thirdparty/utils/ —— file_utils.c / cnpy.* / time_utils.* 与构建脚本
+   - 许可证：Apache-2.0（全文见 server/thirdparty/utils/APACHE-2.0-model-zoo.txt）
+   - 来源：airockchip/rknn3-model-zoo 的 utils/（本仓库只保留推理服务用到的三个库，
+     图像/音频相关的部分未包含，并改写了 CMakeLists）
+
+3. server/thirdparty/tokenizer/ —— Tokenizer.h 与预编译静态库 libtokenizer.a（Linux/aarch64）
+   - 许可证：Apache-2.0（同上 model-zoo 许可证；其上游是 tokenizers-cpp 与 llama.cpp 的 llama_vocab，MIT）
+   - 来源：airockchip/rknn3-model-zoo 的 3rdparty/tokenizer/
+   - 也可自行重建：model-zoo 的 tokenizer/ 目录带源码（本服务的 tokenizer 用法只读 GGUF 词表）
+
+4. server/thirdparty/float16/float16.h
+   - 许可证：Apache-2.0
+   - 来源：airockchip/rknn3-model-zoo 的 3rdparty/rknpu3/include/float16.h
+
+不随本仓库分发的部件（必须自己获取）
+------------------------------------
+
+* Rockchip RKNN3 SDK：`rknn3_api.h`、`librknn3_api.so`、`librknn3_api_rkcp.so`、
+  协处理器固件、`rknn3_transfer_proxy`、`rknn-smi` 等。它们受 Rockchip 的
+  "RKNN SDK License"（见 rknn3-toolkit 仓库的 LICENSE）约束，不允许在本仓库里再分发。
+  取法见 scripts/get_sdk.sh 与 docs/build.md。**下载并使用即表示你已接受该协议。**
+
+* RK1828 开发板系统里的 PCIe 驱动（pcie-rkep）与 udev 规则：由 Rockchip / 板厂 / 卡厂提供。
+
+* 模型权重 XHToken/Spark-X2.6-4B（讯飞 SparkLLM Team）：Apache-2.0，
+  从 ModelScope 自行下载（model/download_model.sh），不在本仓库里。
+
+版本一致性提醒
+--------------
+
+`librknn3_api.so`、`rknn3_transfer_proxy`、协处理器固件、以及 `.rknn` 里内嵌的编译器版本
+必须互相匹配，否则报 `RKNN3_ERR_INCOMPATIBLE_VERSION (-18)` 或 `MODEL_SETUP fail / ACK_FAIL`。
+本项目实测使用的组合：固件 1.2.0 + rknn3 API 1.2.0 + PCIe 驱动 3.3.1 + toolkit 1.2.0。
