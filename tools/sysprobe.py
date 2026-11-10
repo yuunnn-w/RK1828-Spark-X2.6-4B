@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # system 消息到底有没有进模型：往 system 轮埋一个只有该轮知道的暗号，然后只向 user 轮提问。
-# 判据是行为（能否答出暗号）而不是 prompt_tokens —— 后者只作旁证（system 里的填充词不改变它）。
+# 判据是行为（能否答出暗号）而不是 prompt_tokens —— 后者只作旁证（修复前 system 里的填充词不改变它）。
+# 用例覆盖 role:"system" 与 role:"developer"（OpenAI 新版写法），外加一条把暗号放 user 轮的对照。
 #
 # 背景：RKNN3 1.2.0 的 rknn3_session_set_chat_template() 的 system_prompt 参数对 Spark-X2.6 实测无效，
 # 详见 docs/troubleshooting.md §12。本服务默认 --system-in-prompt on 自己把 ChatML 拼进 prompt 文本，
@@ -26,6 +27,9 @@ CASES = [
     ("sys_word", "system", "banana",
      "The secret word named in these instructions is banana.",
      "What is the secret word named in your instructions? Answer with the word only."),
+    ("sys_developer", "developer", "coconut",
+     "The secret nut named in these instructions is coconut.",
+     "What is the secret nut named in your instructions? Answer with the nut word only."),
     # 对照：同样的内容放 user 轮，无论 system 是否生效都应当命中；它不命中说明脚本本身不可信
     ("ctrl_user_number", "user", "4195832",
      "Remember: the magic number in this instruction is 4195832.",
@@ -60,8 +64,8 @@ def main(argv):
     hits = 0
     for name, where, needle, secret, question in CASES:
         msgs = []
-        if where == "system":
-            msgs.append({"role": "system", "content": secret})
+        if where in ("system", "developer"):
+            msgs.append({"role": where, "content": secret})
             msgs.append({"role": "user", "content": question})
         else:
             msgs.append({"role": "user", "content": secret + " " + question})

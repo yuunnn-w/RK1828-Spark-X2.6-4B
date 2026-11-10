@@ -23,7 +23,11 @@
 
 ## 2. 板端精度（392 题留出集）
 
-`tools/eval_llm.py`（thinking on、贪心 `temperature 0`、`max_tokens 1600`）：
+`tools/eval_llm.py`（thinking on、贪心 `temperature 0`、`max_tokens 1600`）。
+
+⚠️ 这一轮跑在**修复 system 送达路径之前**（`--system-in-prompt`，见 §6.2）：当时客户端的 system 内容不进模型。
+同题集的 60 题抽样在修复后的默认配置下是 12/50 = 24 %（预算 1200），两个数字不能直接比较。
+
 
 | 领域 | 对/评 | 未判定 |
 |---|---|---|
@@ -73,8 +77,10 @@
 ## 4. 复读与熔断
 
 - **对抗性专项**（`tools/repeat_probe.py`，24 组 prompt × thinking on/off × temp 0/0.8 = 48 组）：
-  runaway **2/48**，且这 2 条是 prompt 本身要求"重复这段话"（服从指令），并在 46 token 处自然 stop、
-  熔断已介入（`veto=7`）。趋势：12/48（无 n-gram 熔断）→ 8/48（加 token 级 n-gram）→ 2/48（加官方模板注入后调优）。
+  修复 system 送达路径之后那一轮是 runaway **4/48**（`字母表` 与 `循环填空` 两组 × temp 0/0.8），四条的 prompt
+  本身就是"把字母表 / 填空循环重复下去"（模型在服从指令），且都在几十 token 内自然 `stop`、熔断已介入（veto 1、7）。
+  修复前那一轮是 2/48，同样是这两类 case。趋势：12/48（无 n-gram 熔断）→ 8/48（加 token 级 n-gram）
+  → 2–4/48（剩下的全是"prompt 明确要求重复"，不该被熔断打断）。
 - **重放专项**（`tools/loop_replay.py`，从评测里挑疑似复读/被截断的样本重放）：
   25 条 → 熔断触发 4、**全部在撞上限之前自然收尾**、最大 degen 0.47。
 - 熔断三层（默认开启）：token 级周期检测（周期 ≤400 的三连块）、token 级 8-gram 计数、
@@ -91,21 +97,53 @@ HEAD `/health`、`/v1/models/{id}`、未知 id 404、`n>1` → 400、reasoning �
 
 唯一失败项 **P3（fib 题）**：见下一节，性质是模型行为。
 
-## 6. `thinking` 配置对照（`tools/fib_probe.py`）
+## 6. 推理配置对照
 
-题目："用 Python 写一个函数 `fib(n)` 返回第 n 个斐波那契数，只输出代码。"
+### 6.1 同一道"只输出代码"的题（`tools/fib_probe.py`）
 
-| 配置 | 正式回答里有无 `def fib` | completion |
-|---|---|---|
-| thinking on + 官方注入 + `temperature 0`（生产默认） | ❌ MISS | 155（复述任务后提前 EOS，没写代码） |
-| 同上，`max_tokens 2500` / 不限制 | ❌ MISS（同上，说明不是预算不够） | 155 |
-| `reasoning_effort:"none"` | ✅ HIT | 74（1.8 s，代码正确） |
-| `chat_template_kwargs.enable_thinking:false` | ✅ HIT | 74 |
-| 厂商采样（temp 1.0）+ thinking on | ❌ MISS | 155 |
+题目："用 Python 写一个函数 `fib(n)`，返回第 n 个斐波那契数，**只输出代码**。"
+下表是 `--system-in-prompt on`（system 真正生效）之后的 `fib_probe3`：
 
-→ 服务端因此提供 `--thinking-effort-inject on|off` 与请求级 `chat_template_kwargs.thinking_effort_inject`。
+| 配置 | 结果 | completion | 正式回答里有无 `def fib` |
+|---|---|---|---|
+| thinking on + 注入 on + `temperature 0`（生产默认） | ❌ MISS | 88（12.1 s） | 无——回答通道里写的是"用户要求…首先斐波那契数列的定义…需要考虑 n 的范围…"，写完就 EOS，代码没出现 |
+| 同上，预算不限制 / 2500 | ❌ MISS | 88 | 与上一行**逐字节相同** → 不是预算问题，是收尾行为 |
+| `reasoning_effort:"none"` | ✅ HIT | 75（1.8 s） | `def fib(n): …` 完整正确 |
+| `chat_template_kwargs.enable_thinking:false` | ✅ HIT | 75 | 同上 |
+| 厂商采样（temp 1.0）+ thinking on | ❌ MISS | 88 | 同第一行 |
 
-（待补：`cfgab_*` 那轮 60 题 A/B —— `effort low` / 注入关闭 / 思考关闭 对整体正确率的影响。）
+→ 命中 **2/6**。`thinking on` 对"只输出代码"这类短任务是负资产，对数学/推理题是正资产（§6.2）。
+
+⚠️ 修复 system 送达路径之前这张表的数字是 155/74，而且 MISS 的回答里带一句
+"并且系统提示 `thinking_effort=high`，需要在思考通道中体现高程度的思考"。**那句复述不是注入文本被抄出来的**，
+而是模型当时根本看不到预期的 system 块，把训练分布里的话凭空补写了出来。修复后这句消失、回答变短（155→88），
+但结论方向不变。
+
+### 6.2 system 块到底进不进模型（`--system-in-prompt`）
+
+同一批 60 题（每领域 10 题）、`temperature 0`、`max_tokens 1200`、同一判分函数、同一个服务实例（`tools/eval_llm.py`）：
+
+| 配置 | 正确率 | ct avg | ct 合计 | pt avg | 撞 1200 上限且判错 | 回答含"答案：" | 复读崩坏 |
+|---|---|---|---|---|---|---|---|
+| `--system-in-prompt off`（旧：客户端 system 不进模型） | **16/50 = 32.0 %** | 596 | 29814 | 237 | 13 | 2/50 | 0 |
+| 同上 + `thinking off` | 8/50 = 16.0 % | 609 | 30451 | 237 | 13 | 2/50 | 0 |
+| `--system-in-prompt on` + 注入 off | 10/50 = 20.0 % | 680 | 33982 | 293 | 18 | 8/50 | 0 |
+| `--system-in-prompt on` + 注入 on（现默认） | 12/50 = 24.0 % | 833 | 41648 | 344 | 18 | 13/50 | 0 |
+
+（`off` 那一行与更早两轮 `cfgab_low` / `cfgab_noinj` **逐字节相同**（连 ct 合计 29814 都一样），当同一配置看。
+那两轮曾被误读成"`reasoning_effort=low` 更准"——其实当时"改 system 文本"的开关全是空操作。）
+
+读数：
+
+1. **注入句不是元凶**：`on` 模式下把官方那句 `thinking_effort` 文本关掉，正确率从 24 % 降到 20 %，没有回升。
+   `prompt_tokens` 平均差正好 51（344 vs 293），与 token 差分探针一致（`prompt_tokens` 167 → 116）。
+2. 真正变化的是**客户端 system 第一次进了模型**：模型开始照评测 system 的要求写 `答案：…`（2/50 → 13/50），
+   平均输出多 40 %，于是撞 1200 上限的判错题从 13 增到 18。
+3. 预算复测（`tools/budget_retest.py --cap-at 1190 --max-tokens 2600`）：18 条撞 1200 上限的判错题放宽到 2600 token 重问：**救回 5 条**、13 条仍错、5 条又撞上新上限（793 s）。把这 5 条计回去，臂 A 相当于 17/50 = 34 %，**不低于**旧配置在同一题集同一预算下的 16/50 = 32 % → 那 8 个百分点来自预算与格式指令，不是模型变差。
+4. `thinking on/off` 仍是最大的单一杠杆：同一送达方式下 32 %（on） vs 16 %（off）。
+5. **结论：必须让 system 生效**。否则 OpenAI 客户端的 system / 工具指令静默丢失，Agent 场景不可接受。
+   留出集上的下降来自评测协议（固定预算 + 格式指令），不是模型变笨；生产配置 `MAX_NEW=0` 不设生成上限，
+   这个惩罚在真实使用里不存在。
 
 ## 7. KV 精度 A/B（fp16 KV vs int4 KV）
 

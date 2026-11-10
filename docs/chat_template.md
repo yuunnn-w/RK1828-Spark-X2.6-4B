@@ -55,7 +55,7 @@ postfix   = <句结束><句开始><|Bot|> + (<think> 或 </think>)      # 末轮
 - 生成后缀：thinking 开 → `<|Bot|><think>`；thinking 关 → `<|Bot|></think>`。
 - 本服务的映射：`reasoning_effort:"none"|"minimal"` 或 `chat_template_kwargs.enable_thinking:false` → 关闭思考；
   `chat_template_kwargs.reasoning_effort:"low"` → 注入 low 那句；`chat_template_kwargs.thinking_effort_inject:false`
-  或 `--thinking-effort-inject off` → 完全不注入这段（实测有些 prompt 会把它复述出来，见 `docs/benchmarks.md` §6）。
+  或 `--thinking-effort-inject off` → 完全不注入这段。
 - ⚠️ 送达路径：这段文本在 system 块里，而 runtime 的 `set_chat_template` 对 Spark-X2.6 **不吃 `system_prompt`**
   （实测证据见 `docs/troubleshooting.md` §12）。本服务默认 `--system-in-prompt on`，把整段 ChatML 自己拼进
   prompt 文本，注入文本与 `reasoning_effort` 档位才真正落到模型看到的 token 序列上。

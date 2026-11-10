@@ -28,7 +28,7 @@ English README; the Chinese one ([`README_CN.md`](README_CN.md)) is the primary 
 | On-card memory | 4903 / 5120 MB (2.37 GiB weights + KV + internal buffers); `rknn3_model_info` per-core total 4853.74 MB |
 | Decode | **50–52 tok/s** short context (19–20 ms/token); 42.6 tok/s at 14.8k; 35/32 tok/s at 38k/53k |
 | Prefill | 647 tok/s (88 tok, 137 ms) → 788 (4.3k) → 685 (14.8k) → ~460 (38k) |
-| Accuracy (392 held-out items, greedy + thinking) | 99 / 332 scoreable = **29.8 %**; GRQ w4a16 vs bf16 teacher-forced top-1 agreement **96.16 %**, held-out PPL 1.2451 vs 1.2536 (bf16) |
+| Accuracy (392 held-out items, greedy + thinking) | 99 / 332 scoreable = **29.8 %** (measured before the system-prompt-delivery fix, see `docs/benchmarks.md` §2 / §6.2); GRQ w4a16 vs bf16 teacher-forced top-1 agreement **96.16 %**, held-out PPL 1.2451 vs 1.2536 (bf16) |
 | Repetition | **0 genuine degeneration** in 392 items; 2 of 48 adversarial cases run away (both are prompts that literally demand repetition) |
 | Tool calling | Working: `finish_reason=tool_calls`, parseable `arguments`, no fabricated calls when `tools` is absent (4/8 on the official function-calling examples) |
 | Stress/compat | 31-item suite: **1 failure** (a model behaviour, not a server defect); 24 concurrent requests all succeed; 120-request soak with zero errors |
@@ -97,11 +97,14 @@ and **no repetition penalty is applied on purpose** — penalties damage legitim
 Repetition is instead handled by a three-layer circuit breaker (periodic / n-gram / long-block), tunable or
 switchable off with `--fuse-off`.
 
-Two measured rules of thumb:
+Three measured rules of thumb:
 
 - For accuracy-critical calls, **pass `temperature: 0`** — greedy beat the vendor sampling defaults by ~8 points.
 - For "output code only" tasks, prefer **`reasoning_effort: "none"`** (or `thinking: false`) — with thinking on the
   model sometimes restates the task in the answer channel and stops without producing any code.
+- **Do not turn `--system-in-prompt` off**: RKNN3's `set_chat_template()` ignores `system_prompt`, so the old path
+  silently drops client system messages (`tools/sysprobe.py` reproduces it: 1/6 before the fix, 6/6 after).
+  In agent workloads the system turn carries instructions and tool specs — losing it fails silently.
 
 ## Known limitations (honest list)
 

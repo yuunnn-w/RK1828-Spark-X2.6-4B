@@ -11,11 +11,11 @@
 | `longctx_probe.py` | 长上下文阶梯：逐级加大 prompt 并埋 needle 检查回忆，每级后复查卡健康 | `--steps 40000,56000` |
 | `eval_llm.py` | 留出集评测（正确率 / 复读指标 / 用时 / usage），可请求级覆盖 `--thinking`、`--effort`、`--inject`、`--temperature` | `--eval datasets/eval_real.json --per-domain 10 --max-tokens 1200` |
 | `eval_summary.py` | 把上面那份 JSON 汇总成表（含复读率最高的 5 条） | `<json>` |
-| `budget_retest.py` | 把"撞生成上限且判错"的样本放宽预算复测，判断正确率是被预算压低还是真的不会 | `--sample-per-domain 4 --max-tokens 4000` |
+| `budget_retest.py` | 把"撞生成上限且判错"的样本放宽预算复测，判断正确率是被预算压低还是真的不会 | `--sample-per-domain 10 --max-tokens 2600 --cap-at 1190`（`--cap-at` 要取评测那轮 `max_tokens-10`，否则挑不到样本） |
 | `loop_replay.py` | 从评测结果里挑出疑似复读/被截断的样本重放，验证熔断是否生效 | `--limit 20` |
 | `tools_probe.py` | 工具调用链路（官方 function-call 示例那套工具与 prompt），检查 `finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 tools 时不伪造 | — |
 | `defaults_probe.py` | 服务端默认采样是否等于模型厂商推荐；`max_tokens` 不限制/截断/`-1` 语义 | — |
-| `sysprobe.py` | **system 消息有没有真的进模型**：往 system 轮埋暗号只向 user 轮提问（判 `HIT=n/5`）。修复 `--system-in-prompt` 前后分别是 5/5 与 1/5 | `--base http://<host>:8080` |
+| `sysprobe.py` | **system 消息有没有真的进模型**：往 system/developer 轮埋暗号、只向 user 轮提问（判 `HIT=n/6`，含一条 user 轮对照）。修复 `--system-in-prompt` 前后分别是 6/6 与 1/6 | `--base http://<host>:8080` |
 | `feat_probe.py` | 新增 OpenAI 特性（`logit_bias`、`top_logprobs`、`reasoning_effort`、429 + `Retry-After`） | — |
 | `perf_probe.py` / `timing_probe.py` / `mt_sweep.py` | prefill/decode 吞吐与"是否存在每请求固定开销"的定量判定 | — |
 | `fib_probe.py` | 同一道"只输出代码"的题在 6 种推理配置下的对照（结论见 `docs/benchmarks.md`） | — |

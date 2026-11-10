@@ -352,6 +352,14 @@ static std::string spark_tool_calls_text(const json& m) {
   return out;
 }
 
+static bool is_system_role(const std::string& r) {  // OpenAI 新版用 developer 取代 system
+  return r == "system" || r == "developer";
+}
+
+static bool is_tool_role(const std::string& r) {  // 遗留形态 role:"function" 等同 role:"tool"
+  return r == "tool" || r == "function";
+}
+
 static PromptParts compose_spark(const json& messages, bool thinking, const std::string& default_system,
                                  const json& tools, const std::string& reasoning_effort, bool inject_effort,
                                  bool system_in_prompt) {
@@ -369,7 +377,7 @@ static PromptParts compose_spark(const json& messages, bool thinking, const std:
 
   std::string initial_system;
   if (!messages.empty() && messages[0].is_object() && messages[0].contains("role") &&
-      messages[0]["role"].is_string() && messages[0]["role"].get<std::string>() == "system" &&
+      messages[0]["role"].is_string() && is_system_role(messages[0]["role"].get<std::string>()) &&
       messages[0].contains("content")) {
     initial_system = json_content_to_text(messages[0]["content"]);
   }
@@ -394,10 +402,10 @@ static PromptParts compose_spark(const json& messages, bool thinking, const std:
     }
     std::string role = (m.contains("role") && m["role"].is_string()) ? m["role"].get<std::string>() : "user";
     std::string content = m.contains("content") ? json_content_to_text(m["content"]) : "";
-    if (role == "system" && i == 0) {
+    if (is_system_role(role) && i == 0) {
       continue;  // 已并进首个 system 块
     }
-    if (role == "system") {
+    if (is_system_role(role)) {
       Turn t;
       t.marker = SPK_SYS;
       t.body = content;
@@ -415,7 +423,7 @@ static PromptParts compose_spark(const json& messages, bool thinking, const std:
         t.body = "</think>" + content + spark_tool_calls_text(m);
       }
       turns.push_back(t);
-    } else if (role == "tool") {
+    } else if (is_tool_role(role)) {
       std::string wrapped = std::string("<tool_response>") + content + std::string("</tool_response>");
       if (!turns.empty() && turns.back().marker == SPK_TOOL) {
         turns.back().body += wrapped;  // 连续多个 tool 结果共用一个 <|Tool|> 轮

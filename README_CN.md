@@ -23,7 +23,7 @@
 | 卡内存 | 4903 / 5120 MB（权重 2.37 GiB + KV + 内部缓冲），`model_info` Per-Core 合计 4853.74 MB |
 | 解码吞吐 | **50–52 tok/s**（短上下文，19–20 ms/token）；14.8k 上下文 42.6 tok/s；38k/53k 上下文 35/32 tok/s |
 | Prefill 吞吐 | 647 tok/s（88 token，137 ms）→ 788（4.3k）→ 685（14.8k）→ 约 460（38k） |
-| 精度（392 题留出集，贪心 + thinking on） | 可判分 332 题，正确 **99 = 29.8 %**；GRQ w4a16 与 bf16 原模型逐 token top-1 一致率 **96.16 %**，留出集 PPL 1.2451（bf16 为 1.2536） |
+| 精度（392 题留出集，贪心 + thinking on） | 可判分 332 题，正确 **99 = 29.8 %**（该轮测于修复 system 送达路径之前，见 `docs/benchmarks.md` §2 / §6.2）；GRQ w4a16 与 bf16 原模型逐 token top-1 一致率 **96.16 %**，留出集 PPL 1.2451（bf16 为 1.2536） |
 | 复读 | 392 题里**真实复读 0 条**；48 组对抗性 prompt 里 runaway 2 组（都是 prompt 明确要求"重复这段话"）；熔断三层默认开启，误伤时可调 |
 | 工具调用 | 打通：`finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 `tools` 时不会伪造（官方 function-call 示例 8 题命中 4） |
 | 压力/兼容性 | 31 项套件 **失败 1**（唯一失败是模型行为，不是服务缺陷，见"已知限制"）；并发 24 全成功；120 条浸泡零错误零复读 |
@@ -101,11 +101,14 @@ EXTRA_ARGS="--reasoning-format deepseek"      # 思考与答案分离
 # 熔断误伤时：EXTRA_ARGS="... --ngram-ban-at 6 --loop-max-occurrences 4"，或 --fuse-off
 ```
 
-两条实测经验（详见 `docs/benchmarks.md`）：
+三条实测经验（详见 `docs/benchmarks.md`）：
 
 - **精度关键的调用建议显式传 `temperature 0`**：同一批题上贪心比厂商采样高约 8 个百分点。
 - **"只输出代码"这类短任务用 `reasoning_effort:"none"` 或 `thinking:false`**：thinking on 时模型可能把
   复述写在回答通道里就收尾，代码根本不出现（`fib_probe` 六组对照）。
+- **别把 `--system-in-prompt` 关掉**：RKNN3 的 `set_chat_template` 不吃 `system_prompt`，走那条路客户端 system
+  会被静默丢弃（`tools/sysprobe.py` 可复现：修复前 1/6、修复后 6/6）。Agent 场景里 system 装的是指令与工具说明，
+  丢了就是隐性失效。
 
 ## 已知限制（诚实清单）
 

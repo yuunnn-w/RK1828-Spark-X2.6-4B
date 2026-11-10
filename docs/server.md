@@ -61,7 +61,7 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | 主端点。`messages`（string / 多模态数组均可，`role` 支持 `system`/`user`/`assistant`/`tool`，`assistant.tool_calls` 会回填进上下文，`role:"tool"` 渲染成 Spark 的 `tool_call_result` 块）、`stream`、`stream_options.include_usage`、`max_tokens`/`max_completion_tokens`/`n_predict`、`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`repeat_penalty`(或 `extra_body.repeat_penalty`)、`stop`、`seed`、`logprobs`、`tools`+`tool_choice`+`parallel_tool_calls`、`response_format`(`text`/`json_object`/`json_schema`)、`chat_template_kwargs.thinking`/`enable_thinking`、`chat_template_kwargs.thinking_effort_inject`(bool，关掉官方 `thinking_effort` 文本注入)、`reasoning_format`(`deepseek`)、`reasoning_effort`(`none`/`minimal` 关闭思考，`high`/`low` 写入 system 文本)、`logit_bias`（token id → −100…+5，≤−100 即屏蔽）、`top_logprobs`（1..8）；`n>1` 明确返回 400 |
+| `POST` | `/v1/chat/completions` | 主端点。`messages`（string / 多模态数组均可，`role` 支持 `system`/`developer`(OpenAI 新版写法，等同 system)/`user`/`assistant`/`tool`/`function`(遗留，等同 tool)，`assistant.tool_calls` 会回填进上下文，`role:"tool"` 渲染成 Spark 的 `tool_call_result` 块）、`stream`、`stream_options.include_usage`、`max_tokens`/`max_completion_tokens`/`n_predict`、`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`repeat_penalty`(或 `extra_body.repeat_penalty`)、`stop`、`seed`、`logprobs`、`tools`+`tool_choice`+`parallel_tool_calls`、`response_format`(`text`/`json_object`/`json_schema`)、`chat_template_kwargs.thinking`/`enable_thinking`、`chat_template_kwargs.thinking_effort_inject`(bool，关掉官方 `thinking_effort` 文本注入)、`reasoning_format`(`deepseek`)、`reasoning_effort`(`none`/`minimal` 关闭思考，`high`/`low` 写入 system 文本)、`logit_bias`（token id → −100…+5，≤−100 即屏蔽）、`top_logprobs`（1..8）；`n>1` 明确返回 400 |
 | `POST` | `/v1/completions` | 传统补全，`prompt` 原样送入（不做 chat 包装），用于评测与低层实验 |
 | `GET` | `/v1/models`, `/v1/models/{id}` | 模型列表，`meta` 内含 `model_type`、`max_context_len`、`vocab_size`、量化方式 |
 | `GET`/`HEAD` | `/health`, `/healthz` | 就绪探针（模型未加载完 503） |
@@ -137,19 +137,21 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 - 关闭思考：`reasoning_effort: "none" | "minimal"`，或 `chat_template_kwargs.enable_thinking: false`，或 `--thinking off`
 - `/v1/models` 的 `meta.sampling_defaults.thinking_effort_inject` 会回显当前状态
 
-**为什么需要这个开关（实测 `fib_probe`）**：同一道"用 Python 写 `fib(n)`，只输出代码"（`/root/fib_probe.json`）：
+**为什么需要这个开关（实测 `fib_probe`，`--system-in-prompt on` 之后的那一轮）**：
+同一道"用 Python 写 `fib(n)`，只输出代码"（`tools/fib_probe.py`）：
 
 | 配置 | 结果 | completion | 正式回答里有没有 `def fib` |
 |---|---|---|---|
-| thinking on + 注入 on + `temperature 0`（当前生产默认） | MISS | 155 | 无——模型把"用户要求…并且系统提示 `thinking_effort=high`，需要在思考通道中体现高程度的思考…思考过程：…"写在**回答通道**里，写完 155 token 就 EOS，**没有给出代码** |
-| 同上，预算不限制 / 2500 | MISS | 155 | 同上（说明不是预算不够，是收尾行为） |
-| `reasoning_effort:"none"` | **HIT** | 74 | `def fib(n): …` 完整正确代码，1.8 s |
-| `chat_template_kwargs.enable_thinking:false` | **HIT** | 74 | 同上 |
-| 厂商采样（temp 1.0）+ thinking on | MISS | 155 | 同第一行（英文复述） |
+| thinking on + 注入 on + `temperature 0`（当前生产默认） | MISS | 88 | 无——回答通道里写的是"用户要求…首先斐波那契数列的定义…需要考虑 n 的范围…"，写完就 EOS，**没有给出代码** |
+| 同上，预算不限制 / 2500 | MISS | 88 | 与上一行逐字节相同（说明不是预算不够，是收尾行为） |
+| `reasoning_effort:"none"` | **HIT** | 75 | `def fib(n): …` 完整正确代码，1.8 s |
+| `chat_template_kwargs.enable_thinking:false` | **HIT** | 75 | 同上 |
+| 厂商采样（temp 1.0）+ thinking on | MISS | 88 | 同第一行 |
 
-即：**注入文本会被部分 prompt 复述**，而"要求只输出代码"这类短任务在 thinking on 下更容易出现"只复述不作答"。
-官方 README 给的权衡数字是 high→low 平均 −1.7 分、输出长度 −22 %（4B）。
-→ 结论要按任务类型选：数学/推理类 thinking on 更准，"只输出代码"类 thinking off 明显更好（量化数字见 `docs/benchmarks.md` §6）。
+即：修复之后注入文本确实进了模型（`prompt_tokens` 正好多 51），但"只复述不作答"不是它造成的——那是 thinking on
+下短任务的收尾行为。官方 README 给的权衡数字是 high→low 平均 −1.7 分、输出长度 −22 %（4B）；本部署实测
+`reasoning_effort:"low"` 让同一条推理题的输出短 11 %（单样本，只作方向参考，不当结论）。
+→ 按任务类型选：数学/推理类 thinking on 更准（60 题 32 % vs 16 %），"只输出代码"类 thinking off 明显更好（`fib_probe` 2/6）。
 
 ### 4.2 system 块怎么送进模型：`--system-in-prompt`
 
@@ -209,7 +211,9 @@ journalctl -u rk1828-spark -f
   每个 `tool.function` 紧凑 JSON），模型输出 `<tool_call>名称 <arg_key>k</arg_key><arg_value>v</arg_value>`，
   服务端解析成规范 OpenAI `tool_calls`（`name` + 可解析的 `arguments` JSON），`finish_reason="tool_calls"`；
   工具结果走 `<|Tool|>` 轮 + `tool_response` 成对标记回填。实测（官方 function-call 示例那套工具与 prompt）
-  命中 4/8，`tools` 不给时不会伪造 tool_calls。模型自身的工具遵循度决定命中率。
+  命中 4/8（修复 system 送达路径前后都是 4/8：工具定义另一条路 `rknn3_session_set_function_tools()` 本来就是通的），
+  `tools` 不给时不会伪造 `tool_calls`——但模型可能在正文里自己编一段"已调用工具查询到…"的叙述，Agent 侧要自己校验。
+  模型自身的工具遵循度决定命中率。
 - `response_format` 走 runtime 的 grammar（`json_object` → BUILTIN_JSON，`json_schema` → JSON_SCHEMA）。
 - 流式响应无法在同一条连接上继续 keep-alive（没有 Content-Length，靠关连接收尾）。
 - 长上下文 prefill：实测 **38006 token / 72.0 s** 与 **53166 token / 115.6 s** 单次 prefill 均成功且 needle 命中，
@@ -223,7 +227,8 @@ journalctl -u rk1828-spark -f
 | 项 | 值 | 理由 |
 |---|---|---|
 | 模型档位 | `Spark-X2.6-4B-73728-kvi4` | ctx 73728 ≥ 64K，KV int4；卡常驻约 4903/5120 MB |
-| `THINKING` | `on` | thinking=on 在算术/推理题上命中更高（A/B：5/6 vs 4/6），且 `reasoning_effort=high/low` 注入依赖它 |
+| `THINKING` | `on` | thinking=on 在算术/推理留出集上命中明显更高（60 题 32 % vs 16 %）；只有"只输出代码"这类短任务该关（§4.1） |
+| `EFFORT_INJECT` | `on` | 与官方模板逐字一致；实测关掉**不会**提高精度（20 % vs 24 %），只省 51 token 的 system 开销 |
 | `TEMP / TOP_K / TOP_P` | `1.0 / 0 / 0.95` | 模型厂商 `generation_config.json` 的推荐值 |
 | `REPEAT_PENALTY / FREQ / PRESENCE` | `1.0 / 0.0 / 0.0` | **不加任何重复惩罚**：代码里合法的重复结构会被惩罚器误伤 |
 | `MAX_NEW / MAX_NEW_CAP` | `0 / 0` | 输出长度不限制，靠 EOS / 上下文窗口 / 请求超时收尾 |

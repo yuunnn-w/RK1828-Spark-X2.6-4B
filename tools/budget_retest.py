@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 生成预算放宽后的正确率复测：评测时 max_tokens=1600，一批数学题被截断判错。
+# 生成预算放宽后的正确率复测：评测时生成预算有限（例如 max_tokens=1200/1600），一批题会撞上限判错。
 # 这里只挑"撞上限且判错"的样本，用更大的 max_tokens 重问一遍，用同一套判分函数复判，
 # 得到一个更接近真实水平的估计（抽样，不是全量）。
 import argparse
@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--model", default="Spark-X2.6-4B")
     ap.add_argument("--max-tokens", type=int, default=4000)
     ap.add_argument("--sample-per-domain", type=int, default=4)
+    ap.add_argument("--cap-at", type=int, default=1590)   # 判定“撞上限”的 completion_tokens 阈值（取评测那轮 max_tokens-10）
     ap.add_argument("--out", default="results/budget_retest.json")
     args = ap.parse_args()
 
@@ -55,7 +56,7 @@ def main():
     groups = {}
     for x in d["results"]:
         u = x.get("usage") or {}
-        if u.get("completion_tokens", 0) >= 1590 and x.get("verdict") not in ("exact", "numeric", "letter", "unscored"):
+        if u.get("completion_tokens", 0) >= args.cap_at and x.get("verdict") not in ("exact", "numeric", "letter", "unscored"):
             groups.setdefault(x.get("domain", "?"), []).append(x)
     sel = []
     for dom in sorted(groups):

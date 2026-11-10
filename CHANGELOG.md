@@ -43,8 +43,19 @@
 - 压力：31 项套件失败 1（模型行为，非服务缺陷）
 - KV 精度 A/B：int4(28.0 %) 不比 fp16(26.0 %) 差 → 长上下文场景直接用 int4
 
+### 修复
+
+- **system 消息此前不会进入模型**：RKNN3 1.2.0 的 `rknn3_session_set_chat_template()` 不吃 `system_prompt`，
+  客户端 `system` 被静默丢弃（`role:"developer"` 也一律降级成 user）。新增 `--system-in-prompt on`（默认）——
+  整段 ChatML 由服务端拼进 prompt 文本，`tools/sysprobe.py` 从 1/6 变 6/6，`prompt_tokens` 开始包含 system。
+  同时 `role:"developer"` 归入 system、遗留 `role:"function"` 归入 tool。
+  详见 `docs/troubleshooting.md` §12、`docs/server.md` §4.2、`docs/benchmarks.md` §6.2。
+- `finish_reason` 判截断改用"采样器是否选中 EOS"（避开 runtime 的 off-by-one，`max_tokens=64` 现在报 `ct=63/length`）。
+- 归因更正：早期"`reasoning_effort=low` 比 `high` 高约 4 个百分点"实际是同一配置在 `max_tokens 1000 → 1200`
+  下的差异，不是档位效果（当时改 system 文本的开关全是空操作）。
+
 ### 已知限制
 
 - 单 session 串行；`n>1` 拒绝；`beam_search`、多模态输入、`/v1/embeddings`、audio、异步重叠取样未实现
 - `llm_head` 的 w6a16 在 RKNN3 1.2.0 上匹配失败（`Match llm_head with 'auto' failed`），输出头实际按 w4a16 编译
-- `thinking on` 时模型可能"只复述不作答"；`reasoning_effort=low` 在留出集上比 `high` 高约 4 个百分点
+- `thinking on` 时模型可能"只复述不作答"（`fib_probe` 命中 2/6）；同一送达方式下 thinking on 在留出集 32 % vs thinking off 16 %
