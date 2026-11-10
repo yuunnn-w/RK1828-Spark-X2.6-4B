@@ -91,6 +91,7 @@ struct AppConfig {
   std::string reasoning_format = "none";  // none | deepseek
   std::string reasoning_effort;          // 默认思考档位：空 = 官方模板默认 high；可填 high|low|none|minimal
   bool thinking_effort_inject = true;    // 官方模板会把 "Now the system is invoked with thinking_effort=..." 写进 system
+  bool system_in_prompt = true;          // 整段 ChatML（含 system 块）拼进 prompt 文本，而不是交给 set_chat_template
   std::string kvcache_dir = "/run/rknn3/kvcache";
   std::string params_file;
 };
@@ -352,7 +353,8 @@ static std::string spark_tool_calls_text(const json& m) {
 }
 
 static PromptParts compose_spark(const json& messages, bool thinking, const std::string& default_system,
-                                 const json& tools, const std::string& reasoning_effort, bool inject_effort) {
+                                 const json& tools, const std::string& reasoning_effort, bool inject_effort,
+                                 bool system_in_prompt) {
   PromptParts p;
 
   // 照抄官方 chat_template 的 system 组装：默认 system + thinking_effort 说明 + tools 段 + 首条 system
@@ -448,16 +450,25 @@ static PromptParts compose_spark(const json& messages, bool thinking, const std:
       text += turns[i].body;
     }
   }
-  p.prefix = std::string(SPK_SOS) + turns[0].marker;
+  std::string gen_prompt;  // 生成引导；最后一轮已是 assistant 续写时为空
+  if (turns.back().marker != SPK_BOT) {
+    gen_prompt = std::string(SPK_EOS) + SPK_SOS + SPK_BOT + (thinking ? "<think>" : "</think>");
+  }
 
   p.last_role = (turns.back().marker == SPK_TOOL) ? "tool" : "user";
-  if (turns.back().marker == SPK_BOT) {
-    // 续写 assistant 轮：不追加关闭标记
-    p.postfix = "";
+  if (system_in_prompt) {
+    // 实测（RKNN3 1.2.0 + Spark-X2.6）：set_chat_template 的 system_prompt 根本不进模型上下文
+    // （往 system 里放独有信息模型读不到，prompt_tokens 也不计它），官方 multicard 示例同样
+    // 建议"自己把模板拼进 prompt"。所以这里把 system 块、各轮标记与生成引导全写进 prompt 文本。
+    p.text = p.system + std::string(SPK_SOS) + turns[0].marker + text + gen_prompt;
+    p.system.clear();
+    p.prefix.clear();
+    p.postfix.clear();
   } else {
-    p.postfix = std::string(SPK_EOS) + SPK_SOS + SPK_BOT + (thinking ? "<think>" : "</think>");
+    p.prefix = std::string(SPK_SOS) + turns[0].marker;
+    p.postfix = gen_prompt;
+    p.text = text;
   }
-  p.text = text;
   return p;
 }
 
@@ -950,7 +961,7 @@ static void do_chat(const HttpRequest& rq, ResponseWriter& w) {
   json tools_arg = (body.contains("tools") && body["tools"].is_array()) ? body["tools"] : json::array();
   bool inject_effort = (cp.inject_effort >= 0) ? (cp.inject_effort == 1) : g_cfg.thinking_effort_inject;
   PromptParts pp = compose_spark(body["messages"], cp.thinking, g_cfg.system_prompt, tools_arg, cp.effort,
-                                 inject_effort);
+                                 inject_effort, g_cfg.system_in_prompt);
   if (!pp.ok) {
     w.write_full(400, "{\"error\":{\"code\":400,\"message\":\"" + pp.err + "\",\"type\":\"invalid_request_error\"}}",
                  "application/json");
@@ -1315,7 +1326,8 @@ static void do_models(ResponseWriter& w, const std::string& req_id) {
                                {"max_new_tokens_cap", g_cfg.max_new_tokens_cap},
                                {"thinking", g_cfg.default_thinking},
                                {"reasoning_format", g_cfg.reasoning_format},
-                               {"thinking_effort_inject", g_cfg.thinking_effort_inject}};
+                               {"thinking_effort_inject", g_cfg.thinking_effort_inject},
+                               {"system_in_prompt", g_cfg.system_in_prompt}};
   if (!g_cfg.reasoning_effort.empty()) {
     meta["sampling_defaults"]["reasoning_effort"] = g_cfg.reasoning_effort;
   }
@@ -1571,6 +1583,9 @@ static void print_usage(const char* prog) {
       "                          写进 system（默认 on=与官方模板一致；off 可避免模型复述它）\n"
       "  --reasoning-effort high|low|none|minimal  默认思考档位（默认为空 = 跟官方模板一致用 high；\n"
       "                          none/minimal 等同关闭思考；客户端传 reasoning_effort 会覆盖本默认）\n"
+      "  --system-in-prompt on|off  整段 ChatML（含 system 块）自己拼进 prompt 文本（默认 on）。\n"
+      "                          off = 改走 rknn3_session_set_chat_template 的 system_prompt；实测该参数\n"
+      "                          对 Spark-X2.6 不生效（客户端 system 内容进不了模型），仅作对照用\n"
       "  --device-id ID          指定卡（默认第一张）\n"
       "  --log-dir DIR           日志目录（保留参数）\n",
       prog);
@@ -1628,6 +1643,7 @@ int main(int argc, char** argv) {
     else if (a == "--reasoning-format") { g_cfg.reasoning_format = v; ++i; }
     else if (a == "--thinking-effort-inject") { g_cfg.thinking_effort_inject = (v == "on" || v == "1" || v == "true"); ++i; }
     else if (a == "--reasoning-effort") { g_cfg.reasoning_effort = v; ++i; }
+    else if (a == "--system-in-prompt") { g_cfg.system_in_prompt = (v == "on" || v == "1" || v == "true"); ++i; }
     else if (a == "--params-file") { g_cfg.params_file = v; ++i; }
     else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
     else { LOGF("unknown option: %s", a.c_str()); }

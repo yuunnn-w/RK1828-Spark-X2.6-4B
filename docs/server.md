@@ -149,8 +149,26 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 
 即：**注入文本会被部分 prompt 复述**，而"要求只输出代码"这类短任务在 thinking on 下更容易出现"只复述不作答"。
 官方 README 给的权衡数字是 high→low 平均 −1.7 分、输出长度 −22 %（4B）。
-→ 结论要按任务类型选：数学/推理类 thinking on 更准（A/B 5/6 vs 4/6），"只输出代码"类 thinking off 明显更好；
-`cfgab_*` 那轮 60 题 A/B（effort low / 注入关闭 / 思考关闭）给出量化结果后回填本节。
+→ 结论要按任务类型选：数学/推理类 thinking on 更准，"只输出代码"类 thinking off 明显更好（量化数字见 `docs/benchmarks.md` §6）。
+
+### 4.2 system 块怎么送进模型：`--system-in-prompt`
+
+RKNN3 1.2.0 的 `rknn3_session_set_chat_template(session, system_prompt, prompt_prefix, prompt_postfix)` 里，
+**`system_prompt` 对 Spark-X2.6 实测是死的**：往 system 轮埋暗号模型读不到，`prompt_tokens` 也不计它
+（实验与复现方法见 `docs/troubleshooting.md` §12）。官方 multicard 示例用同样的方式绕开它
+（"Apply chat template internally instead of via `set_chat_template`"）。
+
+本服务默认 `--system-in-prompt on`：整段 ChatML（system 块 + 各轮标记 + 生成引导）由服务端自己拼进 prompt 文本，
+`set_chat_template` 三个参数全传空串。修复后客户端 system 真正生效，`--system-prompt`
+（默认 `you are a helpful assistant.`，与官方 Spark demo 一致）也第一次真正起作用。
+
+| 取值 | 行为 |
+|---|---|
+| `on`（默认） | system 块写进 prompt 文本；客户端 system 生效；`prompt_tokens` 含 system |
+| `off` | 旧行为：system 交给 `set_chat_template`（实测内容不会进模型），只用于对照实验 |
+
+推论：`--thinking-effort-inject`、`reasoning_effort` 这类"改 system 文本"的开关，只有在 `on` 模式下才可能落到
+模型真正看到的 token 序列上。
 
 ## 5. 开机自启与进程守护
 

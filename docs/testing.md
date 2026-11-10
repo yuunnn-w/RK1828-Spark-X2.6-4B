@@ -15,6 +15,7 @@
 | `loop_replay.py` | 从评测结果里挑出疑似复读/被截断的样本重放，验证熔断是否生效 | `--limit 20` |
 | `tools_probe.py` | 工具调用链路（官方 function-call 示例那套工具与 prompt），检查 `finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 tools 时不伪造 | — |
 | `defaults_probe.py` | 服务端默认采样是否等于模型厂商推荐；`max_tokens` 不限制/截断/`-1` 语义 | — |
+| `sysprobe.py` | **system 消息有没有真的进模型**：往 system 轮埋暗号只向 user 轮提问（判 `HIT=n/5`）。修复 `--system-in-prompt` 前后分别是 5/5 与 1/5 | `--base http://<host>:8080` |
 | `feat_probe.py` | 新增 OpenAI 特性（`logit_bias`、`top_logprobs`、`reasoning_effort`、429 + `Retry-After`） | — |
 | `perf_probe.py` / `timing_probe.py` / `mt_sweep.py` | prefill/decode 吞吐与"是否存在每请求固定开销"的定量判定 | — |
 | `fib_probe.py` | 同一道"只输出代码"的题在 6 种推理配置下的对照（结论见 `docs/benchmarks.md`） | — |

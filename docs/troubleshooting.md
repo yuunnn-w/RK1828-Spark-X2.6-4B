@@ -95,3 +95,34 @@ demo 路径 50–66 tok/s）。`/v1/completions` 在 1.2.0 里不存在（404）
 - 板端跑任何 rknn3 程序前 `export TMPDIR=/run/rknn3`（本项目的 systemd 单元已设）。
 - `rknn-smi info` 可能打印正常却返回码 251；判断可用性应以 `rknn-smi -v` / `rknn-smi info -l` 的返回码为准。
 - `n_predict` / `-n` 在官方 server 里默认是 `-1 = context size`；本服务 `--max-new-tokens 0` 同义（不限制）。
+
+## 12. system 消息被吃掉：`set_chat_template` 的 `system_prompt` 不生效
+
+现象：客户端 `messages[0].role == "system"` 的内容模型完全读不到（本服务已修，见下）。
+
+定位方法（最小实验，可在任何部署上重跑）：往 system 轮埋一个只有该轮知道的暗号，然后只向 user 轮提问。
+
+| 请求（`temperature 0`） | `prompt_tokens` | 模型能否答出暗号 |
+|---|---|---|
+| system 埋 `kumquat`，user 问"system 里写的秘密水果是什么" | 92 | ❌ 答不出 |
+| 同样内容改放 user 轮（对照） | 104 | ✅ `kumquat` |
+| system 里再加 60 个填充词 | 92（不变） | ❌ |
+| user 里加同样的 60 个填充词 | 153（+61） | — |
+| 重启服务后**第一个**请求就带 system 暗号 | 94 | ❌ |
+
+两点结论：
+
+- 这个 system 字符串既不进模型，也不计进 `prompt_tokens`（runtime 的 `n_prefill_tokens` 里没有它）；
+- 不是"首请求固化"——新进程的第一个请求同样看不到，所以也不是缓存问题。
+
+官方代码其实已经绕开它：`rknn3-toolkit-lite/examples/multicard/rknn_multicard_*_test.py` 写着
+
+> Apply chat template internally instead of via `set_chat_template`, because `set_chat_template` with a
+> non-empty `system_prompt` triggers internal alignment prefill …
+
+本服务的对策：`--system-in-prompt on`（默认）——把整段 ChatML（system 块、各轮标记、生成引导）自己拼进
+prompt 文本，`set_chat_template` 的三个参数全传空串。修复后同一个探针 **5/5** 命中（4 个 system 用例 + 1 个
+user 对照）。`--system-in-prompt off` 保留作对照（旧行为）。详见 `docs/server.md` §4.2。
+
+顺带的正面效果：`prompt_tokens` 现在把 system 计入，上下文预算与用量统计更准；`--system-prompt`
+（默认 `you are a helpful assistant.`，与官方 Spark demo 一致）也第一次真正生效。
