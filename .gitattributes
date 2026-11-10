@@ -20,3 +20,6 @@ NOTICE  text eol=lf
 *.rknn  binary
 *.weight binary
 .gitkeep text eol=lf
+
+# 部署示例文件同样是 Linux 侧读入的文本
+*.example text eol=lf
