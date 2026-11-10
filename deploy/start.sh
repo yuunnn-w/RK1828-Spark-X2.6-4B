@@ -45,5 +45,6 @@ exec env TMPDIR="${TMPDIR:-/run/rknn3}" "$BIN" \
     --max-connections "${MAX_CONNS:-128}" \
     --max-queue "${MAX_QUEUE:-64}" \
     --thinking-effort-inject "${EFFORT_INJECT:-on}" \
+    ${EFFORT:+--reasoning-effort "$EFFORT"} \
     ${API_KEY:+--api-key "$API_KEY"} \
     ${EXTRA_ARGS:-}

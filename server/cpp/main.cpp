@@ -89,6 +89,7 @@ struct AppConfig {
   std::string model_alias = "Spark-X2.6-4B";
   std::string system_prompt = "you are a helpful assistant.";
   std::string reasoning_format = "none";  // none | deepseek
+  std::string reasoning_effort;          // 默认思考档位：空 = 官方模板默认 high；可填 high|low|none|minimal
   bool thinking_effort_inject = true;    // 官方模板会把 "Now the system is invoked with thinking_effort=..." 写进 system
   std::string kvcache_dir = "/run/rknn3/kvcache";
   std::string params_file;
@@ -860,7 +861,7 @@ static ChatParams parse_params(const json& body) {
   }
   // reasoning_effort：本模型只有"想/不想"两档，none/minimal 关掉，其余打开
   {
-    std::string effort;
+    std::string effort = g_cfg.reasoning_effort;   // 服务端默认档位（空 = 跟官方模板一样默认 high）
     if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string()) {
       effort = body["reasoning_effort"].get<std::string>();
     }
@@ -1315,6 +1316,9 @@ static void do_models(ResponseWriter& w, const std::string& req_id) {
                                {"thinking", g_cfg.default_thinking},
                                {"reasoning_format", g_cfg.reasoning_format},
                                {"thinking_effort_inject", g_cfg.thinking_effort_inject}};
+  if (!g_cfg.reasoning_effort.empty()) {
+    meta["sampling_defaults"]["reasoning_effort"] = g_cfg.reasoning_effort;
+  }
   meta["sampling_defaults_note"] =
       "默认取自模型厂商 XHToken/Spark-X2.6-4B 的 generation_config.json（temp 1.0 / top_p 0.95 / top_k -1 / "
       "penalties 关闭 / do_sample true / max_tokens=1048576）；本部署按用途刻意保持 repeat_penalty=1.0（不加重复惩罚）；"
@@ -1565,6 +1569,8 @@ static void print_usage(const char* prog) {
       "  --fuse-off              关掉全部三层熔断（只靠 EOS / 上下文窗口 / 墙钟超时收尾）\n"
       "  --thinking-effort-inject on|off  是否把官方那句 'Now the system is invoked with `thinking_effort=…`'\n"
       "                          写进 system（默认 on=与官方模板一致；off 可避免模型复述它）\n"
+      "  --reasoning-effort high|low|none|minimal  默认思考档位（默认为空 = 跟官方模板一致用 high；\n"
+      "                          none/minimal 等同关闭思考；客户端传 reasoning_effort 会覆盖本默认）\n"
       "  --device-id ID          指定卡（默认第一张）\n"
       "  --log-dir DIR           日志目录（保留参数）\n",
       prog);
@@ -1621,6 +1627,7 @@ int main(int argc, char** argv) {
     else if (a == "--kvcache-dir") { g_cfg.kvcache_dir = v; ++i; }
     else if (a == "--reasoning-format") { g_cfg.reasoning_format = v; ++i; }
     else if (a == "--thinking-effort-inject") { g_cfg.thinking_effort_inject = (v == "on" || v == "1" || v == "true"); ++i; }
+    else if (a == "--reasoning-effort") { g_cfg.reasoning_effort = v; ++i; }
     else if (a == "--params-file") { g_cfg.params_file = v; ++i; }
     else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
     else { LOGF("unknown option: %s", a.c_str()); }
