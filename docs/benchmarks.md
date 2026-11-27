@@ -77,6 +77,20 @@
 - **"换 KV cache 运行时策略能提速"** —— 默认 / `--kvcache-policy 0`(RECURRENT) / `1`(NORMAL) 三档差异在噪声内；
   `--kvcache-policy 0 --kv-n-keep 2048` 直接起不来（HEALTH_FAIL）。
 
+### 客户端传 `top_p=1.0` 时曾经过慢一倍（已修）
+
+服务端对 `top_k` 关闭时的候选上限原来只在 `top_p<1` 时生效，客户端按 OpenAI 默认传 `top_p=1.0` 就退回
+整表 131072 个分数排序。同一 prompt、同样生成 63 个 token，同一服务实例上对照（`tools/sampling_regression.py`）：
+
+| 路径 | 改前 | 改后 |
+|---|---|---|
+| 默认 `top_p=0.95` | 1364 ms（21.7 ms/token，46 tok/s） | 1317 ms（20.9 ms/token，48 tok/s） |
+| 显式 `top_p=1.0` | 2435 ms（38.7 ms/token，26 tok/s） | 1378 ms（21.9 ms/token，46 tok/s） |
+
+改的只是候选规模的条件，默认采样值和默认路径的排序、softmax 都没动。被裁掉的概率有多大由
+`tools/cap_check.cpp` 单独验证：常见分布 1e-7 量级，重尾 1e-4，分布很平时扩到整表（等价于不裁剪）。
+机制写在 `docs/server.md` §4。
+
 ## 4. 复读与熔断
 
 - **对抗性专项**（`tools/repeat_probe.py`，24 组 prompt × thinking on/off × temp 0/0.8 = 48 组）。

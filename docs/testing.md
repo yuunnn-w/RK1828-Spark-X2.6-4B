@@ -1,6 +1,7 @@
 # 测试与验证工具
 
-所有脚本在 `tools/`，只用 Python 3 标准库（板端 python3 直接能跑）和 shell。
+工具都在 `tools/`。Python 的只用标准库（板端 python3 直接能跑），shell 的只用 coreutils；
+`cap_check.cpp` 是唯一的例外，它不碰卡和模型，`g++ -O2 -std=c++11` 就能单独跑。
 默认请求 `http://127.0.0.1:8080`；要从别的机器跑，加 `--base http://<host>:8080`。
 
 先跑哪个：想确认服务正常，用 `protocol_check.py`；想压一压，用 `run_stress_suite.sh`；
@@ -18,6 +19,8 @@
 | `loop_replay.py` | 从评测结果里挑出疑似复读/被截断的样本重放，验证熔断是否生效 | `--limit 20` |
 | `tools_probe.py` | 工具调用链路（官方 function-call 示例那套工具与 prompt），检查 `finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 tools 时不伪造 | — |
 | `defaults_probe.py` | 服务端默认采样是否等于模型厂商推荐；`max_tokens` 不限制/截断/`-1` 语义 | — |
+| `sampling_regression.py` | 改采样实现后的对拍：同 seed 同 prompt 的输出是否逐字节一致，顺带比较默认 `top_p=0.95` 与 OpenAI 默认 `top_p=1.0` 两条路径的 decode 速度 | `[输出 json]`（默认 `results/sampling_regression.json`） |
+| `cap_check.cpp` | 候选上限的算术验证（不需要卡、不需要模型）：常见分布停在 4096、被裁掉的概率约 1e-7；分布很平时扩到整表；客户端给了 `top_k` 就按它截断 | `g++ -O2 -std=c++11 -o cap_check tools/cap_check.cpp && ./cap_check` |
 | `sysprobe.py` | **system 消息有没有真的进模型**：往 system/developer 轮埋暗号、只向 user 轮提问（判 `HIT=n/6`，含一条 user 轮对照）。修复 `--system-in-prompt` 前后分别是 6/6 与 1/6 | `--base http://<host>:8080` |
 | `feat_probe.py` | 新增 OpenAI 特性（`logit_bias`、`top_logprobs`、`reasoning_effort`、429 + `Retry-After`） | — |
 | `protocol_check.py` | **OpenAI 协议验收**：流式 tool_calls 增量、`content=null`、`tool_choice=required`、`stop` 句中截断、未知 `response_format` 400、chunked、CORS、`/v1/responses`、`/v1/embeddings`、多轮 KV 槽位 | `--base`、`--slots on|off`、`--save`、`--compare a.json b.json` |

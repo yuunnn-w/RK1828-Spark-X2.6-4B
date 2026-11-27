@@ -675,32 +675,48 @@ int Engine::sample_token(const float16* logits, int V) {
   if (cand.empty()) {
     return -1;
   }
-  int k = m_req.top_k > 0 ? std::min((int)cand.size(), m_req.top_k) : (int)cand.size();
-  // top_k 关闭（官方 top_k=-1）时，如果还会做核采样截断，就把候选裁到 4096：
-  // 温度 1.0 下 0.95 的质量几乎必然落在前几百个 token 内，裁掉的部分不影响抽样结果，
-  // 但省掉整表 13 万次的 exp/排序，实测能把解码速度救回来。
-  if (m_req.top_k <= 0 && m_req.top_p > 0.0f && m_req.top_p < 1.0f && k > 4096) {
-    k = 4096;
-  }
-  std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                    [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+  // 候选规模：客户端给了 top_k 就按它；top_k 关闭（官方 top_k=-1）时用实现上限 CAP，与 top_p 取值无关。
+  // 旧写法只在 top_p<1 时裁剪，客户端按 OpenAI 默认传 top_p=1.0 就退化成整表 13 万次排序。
+  const int CAP = 4096;
+  int k = m_req.top_k > 0 ? std::min((int)cand.size(), m_req.top_k) : std::min((int)cand.size(), CAP);
   float t = m_req.temperature;
-  std::vector<float> p((size_t)k);
+  std::vector<float> p;
   float sum = 0.0f;
-  for (int i = 0; i < k; ++i) {
-    p[i] = std::exp((cand[i].first - cand[0].first) / t);
-    sum += p[i];
-  }
   int limit = k;
-  if (m_req.top_p > 0.0f && m_req.top_p < 1.0f && sum > 0.0f) {
-    float acc = 0.0f;
+  for (;;) {
+    std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+    p.assign((size_t)k, 0.0f);
+    sum = 0.0f;
     for (int i = 0; i < k; ++i) {
-      acc += p[i] / sum;
-      if (acc >= m_req.top_p) {
-        limit = i + 1;
-        break;
+      p[i] = std::exp((cand[i].first - cand[0].first) / t);
+      sum += p[i];
+    }
+    limit = k;
+    if (m_req.top_p > 0.0f && m_req.top_p < 1.0f && sum > 0.0f) {
+      // 核采样：在保留的候选里累到 top_p 为止
+      float acc = 0.0f;
+      for (int i = 0; i < k; ++i) {
+        acc += p[i] / sum;
+        if (acc >= m_req.top_p) {
+          limit = i + 1;
+          break;
+        }
       }
     }
+    // 裁掉的都是第 k 名之后的候选，所以它们的概率和有一个上界：rem * exp((第 k 名 - 第 1 名)/t)。
+    // 上界超过保留质量的 1% 才扩大候选（只在分布极平的时候发生），最多回到整表。
+    // 客户端自己给了 top_k 就不扩大——那是它明确要的截断。
+    bool grow = false;
+    int rem = (int)cand.size() - k;
+    if (m_req.top_k <= 0 && rem > 0 && sum > 0.0f) {
+      float tail = (float)rem * std::exp((cand[k - 1].first - cand[0].first) / t);
+      grow = tail > 0.01f * sum;
+    }
+    if (!grow) {
+      break;
+    }
+    k = std::min((int)cand.size(), k * 4);
   }
   if (m_req.want_logprobs && sum > 0.0f) {
     std::vector<TokenProb> v;
