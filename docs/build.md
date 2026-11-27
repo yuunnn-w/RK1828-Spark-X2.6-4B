@@ -1,5 +1,8 @@
 # 环境与编译
 
+这篇讲三件事：两台机器各要装什么、板端服务怎么编、版本不一致时会报什么错。
+先在脑子里过一遍"转换机负责出模型文件，板子负责跑"，后面的命令就不容易放错机器。
+
 整个项目分两台机器：
 
 | 机器 | 干什么 | 硬性要求 |
@@ -66,8 +69,8 @@ CMake 会把运行时 `.so` 收进 `server/build/lib/`，可执行文件的 RPAT
 
 ## 4. 版本一致性（最容易踩的坑）
 
-`librknn3_api.so`、`rknn3_transfer_proxy`、协处理器固件、以及 `.rknn` 里内嵌的编译器版本必须**同代**，
-否则：
+下面四样东西的版本必须**同代**：`librknn3_api.so`、`rknn3_transfer_proxy`、卡固件、`.rknn` 里内嵌的编译器。
+不同代会出现下面三种报错：
 
 - `RKNN3_ERR_INCOMPATIBLE_VERSION (-18)`，或
 - `MODEL_SETUP fail, ack = ACK_FAIL`（用 1.2.0 toolkit 转的模型跑在 1.1.0 固件的卡上），或

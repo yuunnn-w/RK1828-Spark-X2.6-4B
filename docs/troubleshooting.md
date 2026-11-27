@@ -1,6 +1,7 @@
 # 踩过的坑与排查顺序
 
-按"现象 → 根因 → 处置"排列。前 4 条是会让人浪费一整天的那种。
+按"现象 → 根因 → 处置"排列。先按症状找到对应条目，每条都给了可以直接执行的检查命令。
+前 4 条是会让人浪费一整天的那种，第一次部署建议先读一遍。
 
 ---
 
@@ -33,14 +34,22 @@
 
 ## 4. 官方 `rkllm3-server` 服务 Spark 模型会输出乱码
 
-`rkllm3-server` 1.2.0 对 `model_type=spark2_5` 的链路是坏的：
-48 题评测里 **0 正确、39/40 复读崩坏**，输出从第一个 token 就是 `<think>我们, `、`, `、`**，请，请，请…`。
-穷举验证过 6 个变体：默认 / `--chat-template-file`（自定义成与 demo 逐字一致）/ template + `--reasoning auto|on|off`
-/ `--rope-tensor` / 采样参数变化。其中一项决定性证据：自定义 chat template **确实生效**
-（日志打印出我们的模板，`prompt_tokens` 从 26 降到 16，输入 token 序列完全正确），**输出照样崩坏**
-→ chat template 假设被证伪，问题在 server 的运行时链路（server 侧走 `rknn3_session_run_async` +
-`set_kvcache_policy(n_keep=0, group_size=1)`，且不调 `rknn3_session_set_chat_template`，解码只有 16 tok/s；
-demo 路径 50–66 tok/s）。`/v1/completions` 在 1.2.0 里不存在（404），无法直接喂相同 prompt 对照。
+`rkllm3-server` 1.2.0 对 `model_type=spark2_5` 的链路是坏的：48 题评测里 **0 题正确、39/40 复读崩坏**，
+输出从第一个 token 就开始乱（`<think>我们, `、`, `、`**，请，请，请…`）。
+
+穷举过 6 个变体，都没救回来：
+
+- 默认配置
+- `--chat-template-file`（模板改成和 C++ demo 逐字一致）
+- 换模板后再加 `--reasoning auto|on|off`
+- `--rope-tensor`
+- 改采样参数
+
+其中一条是决定性证据：自定义 chat template **确实生效了**——日志打印出了我们的模板，`prompt_tokens`
+从 26 降到 16，输入 token 序列完全正确，但**输出照样崩坏**。所以问题不在模板，在 server 的运行时链路：
+server 侧走 `rknn3_session_run_async` + `set_kvcache_policy(n_keep=0, group_size=1)`，不调
+`rknn3_session_set_chat_template`，解码只有 16 tok/s；demo 路径是 50–66 tok/s。
+另外 1.2.0 的 `/v1/completions` 不存在（404），没法直接喂相同 prompt 做对照。
 
 结论：**Spark 系列只能走 C++ demo 路径**，也就是本仓库的 `rknn_spark_server`。
 

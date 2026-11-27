@@ -1,5 +1,8 @@
 # 转换：从 HuggingFace 模型到能在 RK1828 上跑的文件
 
+这篇讲四件事：转换会产出哪些文件、每个文件放在哪、量化和 KV 档位怎么选、怎么判断卡内存够不够。
+如果你只想知道"跑哪条命令"，直接看下面的一键命令；其余小节是选错档位时用来查原因的。
+
 ## 产物清单（RKNN3 的权重分离格式）
 
 | 文件 | 内容 | 放哪 |
@@ -35,18 +38,21 @@ cd ../../model/out/build_73728 && python3 ../../convert/export_rknn.py   # 参�
 
 ## 量化档位
 
-- **权重**：`rknn.config(quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32')`；
-  真正的精度来自 **GRQ**（`export_llm.py --quant`，走 `RKQuantizer.quantize(..., quantized_algorithm='grq')`，需要 CUDA）。
-  本项目实测 GRQ w4a16/group32 + 884 条真实校准，在留出集上 PPL **1.2451**，bf16 原模型 **1.2536**（甚至略低），
-  逐 token top-1 与 bf16 一致率 **96.16 %** → 权重侧 int4 不是精度瓶颈（见 `docs/benchmarks.md`）。
-- ⚠️ `--quant` 在无 CUDA 时会被官方脚本**静默跳过**（条件写成 `if args.quant and torch.cuda.is_available()`），
-  不报错。判断有没有生效：看日志里有没有 GRQ 相关输出，或比对 ONNX 大小/权重字节。
-- ⚠️ 1.2.0 对 Spark 的 `llm_head` 配置 **匹配失败**（打印 `Match llm_head with 'auto' failed`），
-  于是输出头按全局 w4a16/group32 编译，拿不到默认配置里声明的 w6a16。
-  模型 ONNX 的输出头是 `MatMul node_linear_216`（权重 `model.lm_head.weight` 先过 `Transpose`，
-  后面还挂着 `keep_one_logit` 的 `Gather`）。想显式指定 head 位宽需要正确的张量名，本仓库尚未验证哪个名字被接受。
+- **权重**：先用 `rknn.config(quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32')`
+  定基础档位。真正决定精度的是 **GRQ**（`export_llm.py --quant` 内部走
+  `RKQuantizer.quantize(..., quantized_algorithm='grq')`，需要 CUDA）。本项目用 GRQ w4a16/group32 +
+  884 条真实校准，留出集 PPL **1.2451**，bf16 原模型是 **1.2536**（int4 甚至略低）；逐 token top-1
+  与 bf16 一致率 **96.16 %**。所以权重侧 int4 不是精度瓶颈（见 `docs/benchmarks.md`）。
+- ⚠️ 没有 CUDA 时，官方脚本会**静默跳过** `--quant`（条件是 `if args.quant and torch.cuda.is_available()`），
+  不会报错。判断 GRQ 有没有生效：看日志里有没有 GRQ 输出，或比对 ONNX 大小 / 权重字节。
+- ⚠️ 1.2.0 匹配不上 Spark 的 `llm_head`，会打印 `Match llm_head with 'auto' failed`。结果输出头按全局
+  w4a16/group32 编译，拿不到默认配置里写的 w6a16。模型 ONNX 里输出头是 `MatMul node_linear_216`
+  （权重 `model.lm_head.weight` 先过 `Transpose`，后面还挂着 `keep_one_logit` 的 `Gather`）。
+  想显式指定 head 位宽需要正确的张量名，本仓库还没验证哪个名字会被接受。
 
 ## KV Cache 档位（决定卡内存与上下文上限）
+
+一句话：KV 档位只能在下面 6 个固定组合里选，选完必须重新转换；档位越高越准，也越占卡内存。
 
 `export_rknn.py` 里 `attention_config` 是**两条**（Spark 是混合注意力：36 层里 9 层 full、27 层 sliding，窗口 512）：
 先 sliding 档（`kvcache_buffer_len=512`、`sliding_window_size=512`），再 full 档（`kvcache_buffer_len=CTX`）。
@@ -66,6 +72,8 @@ cd ../../model/out/build_73728 && python3 ../../convert/export_rknn.py   # 参�
 **改 KV 配置必须重新转换**（`.rknn` 会变，`.weight` 不变）。
 
 ## 卡内存判定：必须用 `rknn3_model_info`，别信公式
+
+公式算出来的数字偏低，按公式选档位会在 `session_init` 时失败。以 `rknn3_model_info` 的实测为准。
 
 板端执行：
 
@@ -91,8 +99,9 @@ Spark-X2.6-4B 实测（toolkit 1.2.0，8 核 `0xff`，单位 MB）：
 → 合计 **≈ 32.7 KiB/token**；fp16 档实测 **≈ 84 KiB/token**。
 线性内插出 int4 档的 ctx 硬上限 ≈ **79,900 token**。
 
-⚠️ 教科书公式 `全注意力层数 × kv_heads × head_dim × 2 × 字节`（Spark 是 9×4×256×2）只给 9.2 KB/token，
-**比实测低 3.6 倍**，因为它忽略了滑窗层缓冲、分组量化残差与元数据 —— 只能用于横向比较，不能用来判断装不装得下。
+⚠️ 教科书公式 `全注意力层数 × kv_heads × head_dim × 2 × 字节`（Spark 是 9×4×256×2）只算出 9.2 KB/token，
+**比实测低 3.6 倍**。原因是它没算滑窗层缓冲、分组量化残差和元数据。这个公式只能用来横向比较，
+不能用来判断某个档位装不装得下。
 
 ## 已经证伪的"省内存错觉"
 

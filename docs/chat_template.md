@@ -1,8 +1,8 @@
 # Spark-X2.6 的 chat template：服务端怎么组装 prompt
 
-这一节是给"想自己写客户端 / 自己接 runtime"的人看的。**Spark 的对话格式不是 ChatML**，
-照 ChatML 拼出来的 prompt 会让模型行为退化（官方 `rkllm3-server` 的 Spark 链路坏掉后，
-这是第二重要的坑）。
+这一节是给"想自己写客户端 / 自己接 runtime"的人看的。如果只记一件事：
+**Spark 的对话格式不是 ChatML**，照 ChatML 拼 prompt 会让模型行为退化。这是官方
+`rkllm3-server` 的 Spark 链路之外，第二容易踩的坑。
 
 ## 1. 词表里的控制标记（逐字）
 
@@ -14,7 +14,8 @@
 | 思考通道 | `<think>` / `</think>` | 成对；没有思考内容时官方模板只写闭合标记 |
 | 工具 | `<tool_call>`、`<arg_key>`/`</arg_key>`、`<arg_value>`/`</arg_value>`、`<tools>`/`</tools>`、`<tool_response>`/`<tool_response>` | 见 §3 |
 
-（表里角色标记写成 `<\|System\|>` 只是为了避免 Markdown 把它当表格分隔符 —— 实际是 `<` + `|` + `System` + `|` + `>`。）
+说明：表里角色标记写成 `<\|System\|>`，只是为了不让 Markdown 把它当表格分隔符。实际字符是
+`<` + `|` + `System` + `|` + `>`（ASCII 竖线）。
 
 ## 2. 一轮对话的组装顺序
 
@@ -62,15 +63,15 @@ postfix   = <句结束><句开始><|Bot|> + (<think> 或 </think>)      # 末轮
 
 ## 5. 与官方实现的一致性是怎么验证的
 
-不是靠眼看。方法：在转换机上用**与模型 `transformers_version` 相同的 4.57.1** 和官方仓库的
-`tokenizer.apply_chat_template(...)` 生成 11 组参考 prompt（脚本 `convert/render_chat_template.py`），
-再用本仓库 `convert/check_chat_template.py` 把服务端 `compose_spark()` 的等价 Python 镜像与之**逐字节 diff**。
+不是靠眼看，而是逐字节比。做法：在转换机上用**与模型 `transformers_version` 相同的 4.57.1**，
+调官方仓库的 `tokenizer.apply_chat_template(...)` 生成 11 组参考 prompt（`convert/render_chat_template.py`），
+再用 `convert/check_chat_template.py` 把服务端 `compose_spark()` 的 Python 镜像和它逐字节 diff。
 
 结果：**8/11 完全一致**（含中文工具描述、工具调用历史、连续多工具结果、多 system、content 为文本数组、
 thinking off、effort low）。剩下 3 处只差同一个有意偏差：末轮是 assistant 时服务端不追加生成后缀
 （续写语义，等价 llama.cpp 的 `continue_final_message`）。
 
-两处**官方更严格**、本服务端**有意更宽松**的地方：
+有两处官方更严格、本服务有意更宽松（为了兼容常见的 OpenAI 客户端）：
 
 | 情况 | 官方模板 | 本服务 |
 |---|---|---|
