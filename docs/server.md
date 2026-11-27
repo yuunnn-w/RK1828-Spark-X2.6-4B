@@ -78,7 +78,7 @@ KV 槽位的镜像放在内存盘里。`deploy/start.sh` 会检查 `KV_SLOT_DIR`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | 主接口。`messages`、`stream`、`stream_options.include_usage`、`max_tokens`/`max_completion_tokens`/`n_predict`、`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`repeat_penalty`、`stop`、`seed`、`logprobs`、`top_logprobs`、`logit_bias`、`tools` + `tool_choice` + `parallel_tool_calls`、`response_format`、`reasoning_format`、`reasoning_effort`、`chat_template_kwargs`；`n>1` 返回 400 |
+| `POST` | `/v1/chat/completions` | 主接口，参数见下方列表；`n>1` 返回 400 |
 | `POST` | `/v1/completions` | 传统补全。`prompt` 原样送进模型，不做 chat 包装，适合评测和底层实验 |
 | `POST` | `/v1/responses` | OpenAI Responses API（流式 + 非流式）。`instructions`、`input`（字符串或 item 数组）、扁平 `tools`、`tool_choice`、`max_output_tokens`、`reasoning.effort`、`text.format` |
 | `POST` | `/v1/embeddings` | 词嵌入表均值池化 + L2 归一化（本模型 2560 维）。只是近似嵌入，不是训练过的 embedding 模型 |
@@ -89,6 +89,16 @@ KV 槽位的镜像放在内存盘里。`deploy/start.sh` 会检查 `KV_SLOT_DIR`
 | `POST` | `/slots/{id}/pause\|resume\|interrupt` | 对应 `rknn3_session_pause/resume/stop` |
 | `POST` | `/slots/{id}/kvcache/save\|load`、`/v1/kvcache/save\|load` | 对应 `rknn3_session_save_kvcache` / `load_kvcache_from_path`，默认目录 `/run/rknn3/kvcache` |
 | `OPTIONS` | 任意 | CORS 预检 |
+
+`/v1/chat/completions` 支持的参数：
+
+- 对话：`messages`（`system/developer`、`user`、`assistant`、`tool/function`）
+- 流式：`stream`、`stream_options.include_usage`
+- 长度与停止：`max_tokens` / `max_completion_tokens` / `n_predict`、`stop`
+- 采样：`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`repeat_penalty`、`seed`
+- 概率与偏置：`logprobs`、`top_logprobs`、`logit_bias`
+- 工具与格式：`tools`、`tool_choice`、`parallel_tool_calls`、`response_format`
+- 思考控制：`reasoning_format`、`reasoning_effort`、`chat_template_kwargs.{thinking,enable_thinking,thinking_effort_inject}`
 
 响应是 OpenAI 的形状：`id/object/created/model/choices[]/usage`。流式用 SSE（`data: {...}`，最后
 `data: [DONE]`），第一块带 `delta.role="assistant"`，结束块带 `finish_reason`，`include_usage` 时
