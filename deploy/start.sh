@@ -8,6 +8,14 @@ if [ -f "$CONF" ]; then
     . "$CONF"
 fi
 
+# KV 槽位镜像目录：配置了 KV_SLOT_TMPFS_SIZE 时，若目录还不是 tmpfs 就挂一个（纯内存，掉电即失）
+if [ -n "${KV_SLOT_DIR:-}" ] && [ -n "${KV_SLOT_TMPFS_SIZE:-}" ]; then
+    mkdir -p "$KV_SLOT_DIR"
+    if ! mountpoint -q "$KV_SLOT_DIR"; then
+        mount -t tmpfs -o "size=$KV_SLOT_TMPFS_SIZE,mode=0755" tmpfs "$KV_SLOT_DIR" ||             echo "warn: mount tmpfs on $KV_SLOT_DIR failed; KV images will live on disk" >&2
+    fi
+fi
+
 BIN=${BIN:-$PREFIX/bin/rknn_spark_server}
 MODEL_DIR=${MODEL_DIR:-$PREFIX/model}
 MODEL_NAME=${MODEL_NAME:-Spark-X2.6-4B-73728-kvi4}
@@ -45,6 +53,12 @@ exec env TMPDIR="${TMPDIR:-/run/rknn3}" "$BIN" \
     --max-connections "${MAX_CONNS:-128}" \
     --max-queue "${MAX_QUEUE:-64}" \
     --thinking-effort-inject "${EFFORT_INJECT:-on}" \
+    --kv-slots "${KV_SLOTS:-0}" \
+    --kv-slot-dir "${KV_SLOT_DIR:-/run/rk1828-kv}" \
+    --kv-slot-min-tokens "${KV_SLOT_MIN_TOKENS:-1024}"     --kv-slot-max-image-mb "${KV_SLOT_MAX_IMAGE_MB:-2560}"     --kv-slot-max-total-mb "${KV_SLOT_MAX_TOTAL_MB:-10240}" \
+    --stream-tools "${STREAM_TOOLS:-on}" \
+    --tool-grammar "${TOOL_GRAMMAR:-on}" \
+    --embeddings "${EMBEDDINGS:-on}" \
     ${EFFORT:+--reasoning-effort "$EFFORT"} \
     ${API_KEY:+--api-key "$API_KEY"} \
     ${EXTRA_ARGS:-}

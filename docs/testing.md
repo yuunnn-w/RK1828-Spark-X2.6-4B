@@ -17,6 +17,8 @@
 | `defaults_probe.py` | 服务端默认采样是否等于模型厂商推荐；`max_tokens` 不限制/截断/`-1` 语义 | — |
 | `sysprobe.py` | **system 消息有没有真的进模型**：往 system/developer 轮埋暗号、只向 user 轮提问（判 `HIT=n/6`，含一条 user 轮对照）。修复 `--system-in-prompt` 前后分别是 6/6 与 1/6 | `--base http://<host>:8080` |
 | `feat_probe.py` | 新增 OpenAI 特性（`logit_bias`、`top_logprobs`、`reasoning_effort`、429 + `Retry-After`） | — |
+| `protocol_check.py` | **OpenAI 协议验收**：流式 tool_calls 增量、`content=null`、`tool_choice=required`、`stop` 句中截断、未知 `response_format` 400、chunked、CORS、`/v1/responses`、`/v1/embeddings`、多轮 KV 槽位 | `--base`、`--slots on|off`、`--save`、`--compare a.json b.json` |
+| `reasoning_probe.py` | 思考通道专项：thinking on/off × 非流式/流式 × 完整/截断，检查 `reasoning_content` 与 SSE 每行 UTF-8 | `--base` |
 | `perf_probe.py` / `timing_probe.py` / `mt_sweep.py` | prefill/decode 吞吐与"是否存在每请求固定开销"的定量判定 | — |
 | `fib_probe.py` | 同一道"只输出代码"的题在 6 种推理配置下的对照（结论见 `docs/benchmarks.md`） | — |
 | `kv_sweep.sh` | KV cache 运行时策略扫描（默认 / RECURRENT / NORMAL / `n_keep`） | 会临时改 env 并在结束时恢复 |

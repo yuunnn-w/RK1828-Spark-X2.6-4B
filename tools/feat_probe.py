@@ -43,20 +43,20 @@ top = (cont[0].get("top_logprobs") or []) if cont else []
 check("top_logprobs=5", st == 200 and len(top) >= 2, "st=%s entries=%d ids=%s" % (st, len(top),
       [t.get("token_id") for t in top[:5]]))
 
-# 2) logit_bias 屏蔽自然首选 token
-st, d = ask("只回答一个阿拉伯数字：1+1=?", {"logprobs": True})
+# 2) logit_bias 屏蔽自然首选 token（关掉思考，避免 max_tokens 截断后 content 为空）
+st, d = ask("只回答一个阿拉伯数字：1+1=?", {"logprobs": True, "thinking": False})
 cont = ((d.get("choices") or [{}])[0].get("logprobs") or {}).get("content") or []
 first_id = cont[0]["token_id"] if cont else None
 base_text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 if first_id is None:
     check("logit_bias 屏蔽", False, "拿不到 baseline token id (st=%s)" % st)
 else:
-    st2, d2 = ask("只回答一个阿拉伯数字：1+1=?", {"logit_bias": {str(first_id): -100}})
+    st2, d2 = ask("只回答一个阿拉伯数字：1+1=?", {"logit_bias": {str(first_id): -100}, "thinking": False})
     new_text = ((d2.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     check("logit_bias 屏蔽", st2 == 200 and new_text.strip() != base_text.strip() and len(new_text) > 0,
           "blocked_id=%s base=%r biased=%r" % (first_id, base_text[:40], new_text[:40]))
     # 正向偏置也应改变选择
-    st3, d3 = ask("只回答一个阿拉伯数字：1+1=?", {"logit_bias": {str(first_id): 5.0, "2": 5.0}})
+    st3, d3 = ask("只回答一个阿拉伯数字：1+1=?", {"logit_bias": {str(first_id): 5.0, "2": 5.0}, "thinking": False})
     t3 = ((d3.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     check("logit_bias 正偏置", st3 == 200 and len(t3) > 0, "st=%s out=%r" % (st3, t3[:40]))
 

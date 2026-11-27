@@ -60,6 +60,7 @@ add_executable(rknn_spark_server
     cpp/main.cpp
     cpp/engine.cpp
     cpp/httpd.cpp
+    cpp/kvslots.cpp
 )
 
 target_include_directories(rknn_spark_server PRIVATE

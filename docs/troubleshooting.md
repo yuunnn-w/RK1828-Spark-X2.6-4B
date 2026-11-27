@@ -126,3 +126,19 @@ user 对照）。`--system-in-prompt off` 保留作对照（旧行为）。详�
 
 顺带的正面效果：`prompt_tokens` 现在把 system 计入，上下文预算与用量统计更准；`--system-prompt`
 （默认 `you are a helpful assistant.`，与官方 Spark demo 一致）也第一次真正生效。
+
+## 13. KV 槽位不命中 / `n_reuse_tokens` 恒为 0
+
+按顺序查：
+
+1. **是不是每轮都在重设 chat template / 工具 / grammar**。runtime 会因此清空 KV。1.1.0 起服务只在
+   内容变化时下发这些设置；如果你改过 `engine.cpp` 这一段，先确认没有退回去。
+2. **续接点是不是正好在镜像末尾**。Spark 是滑窗注意力，截断到中间位置需要 checkpoint，默认策略下
+   runtime 会报 `can not find the kvcache_checkpoint pos: N`。槽位只会做"精确末端续接"。
+3. **客户端有没有原样回放**上一轮 assistant 的 `content` 和 `reasoning_content`。回放被裁剪/改写
+   （包括工具调用参数重新序列化后格式不同）都会退回冷启动。
+4. 看 `/v1/slots` 的 `kv_reuse_probe`：`unsupported` 表示启动自检发现这个 runtime 不支持复用，槽位被
+   自动关闭；`ok` 才说明自检通过。再看每题日志里的 `kvslot slot N hit: prefix=...` 与
+   `state: prefill=... reuse=...`。
+5. 槽位默认 `--kv-slot-min-tokens 1024`，短于这个长度的会话不建镜像；测试时可用
+   `--kv-slot-min-tokens 16` 配合长 system prompt 复现。

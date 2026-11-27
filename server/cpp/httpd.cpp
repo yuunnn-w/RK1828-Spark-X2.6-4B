@@ -73,6 +73,9 @@ class SocketWriter : public ResponseWriter {
     h += "Content-Type: " + ctype + "\r\n";
     h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     h += "Access-Control-Allow-Origin: *\r\n";
+    h += "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n";
+    h += "Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n";
+    h += "Access-Control-Max-Age: 86400\r\n";
     if (status == 429) {
       h += "Retry-After: 2\r\n";
     } else if (status == 503) {
@@ -90,6 +93,9 @@ class SocketWriter : public ResponseWriter {
     std::string h = "HTTP/1.1 " + std::to_string(status) + " " + status_text(status) + "\r\n";
     h += "Content-Type: " + ctype + "\r\n";
     h += "Access-Control-Allow-Origin: *\r\n";
+    h += "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n";
+    h += "Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n";
+    h += "Access-Control-Max-Age: 86400\r\n";
     h += m_keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     h += "\r\n";
     write_raw(h.data(), h.size());
@@ -331,13 +337,8 @@ void HttpServer::handle_conn(int fd, const std::string& peer) {
       clen = atol(it->second.c_str());
     }
     std::string te = req.headers.count("transfer-encoding") ? lower_str(req.headers["transfer-encoding"]) : "";
-    if (te.find("chunked") != std::string::npos) {
-      SocketWriter w(fd, false);
-      w.write_full(501, "{\"error\":{\"code\":501,\"message\":\"chunked request bodies unsupported\"}}",
-                   "application/json");
-      goto done;
-    }
-    if (clen < 0 || clen > (long)m_opt.max_body_bytes) {
+    bool chunked = te.find("chunked") != std::string::npos;
+    if (!chunked && (clen < 0 || clen > (long)m_opt.max_body_bytes)) {
       SocketWriter w(fd, false);
       w.write_full(413, "{\"error\":{\"code\":413,\"message\":\"request body too large\"}}", "application/json");
       goto done;
@@ -346,18 +347,112 @@ void HttpServer::handle_conn(int fd, const std::string& peer) {
       static const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
       write(fd, cont, strlen(cont));
     }
-    while ((long)buf.size() < clen) {
-      ssize_t n = read(fd, tmp, sizeof(tmp));
-      if (n <= 0) {
-        if (n < 0 && errno == EINTR) {
-          continue;
+    if (chunked) {
+      // RFC 7230 分块传输：size 行（可带 ;ext）→ 数据 → CRLF，0 块后跟 trailer
+      req.body.clear();
+      bool fail = false;
+      for (;;) {
+        size_t pos = std::string::npos;
+        while ((pos = buf.find("\r\n")) == std::string::npos) {
+          ssize_t n = read(fd, tmp, sizeof(tmp));
+          if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+              continue;
+            }
+            fail = true;
+            break;
+          }
+          buf.append(tmp, (size_t)n);
+          if (buf.size() > (size_t)m_opt.max_body_bytes + 4096) {
+            fail = true;
+            break;
+          }
         }
+        if (fail) {
+          break;
+        }
+        std::string line = buf.substr(0, pos);
+        buf.erase(0, pos + 2);
+        size_t semi = line.find(';');
+        long sz = strtol(line.substr(0, semi == std::string::npos ? line.size() : semi).c_str(), NULL, 16);
+        if (sz < 0) {
+          fail = true;
+          break;
+        }
+        if (sz == 0) {
+          for (;;) {  // trailer 段：读到空行为止
+            while ((pos = buf.find("\r\n")) == std::string::npos) {
+              ssize_t n = read(fd, tmp, sizeof(tmp));
+              if (n <= 0) {
+                if (n < 0 && errno == EINTR) {
+                  continue;
+                }
+                fail = true;
+                break;
+              }
+              buf.append(tmp, (size_t)n);
+              if (buf.size() > (size_t)m_opt.max_header_bytes + 4096) {
+                fail = true;
+                break;
+              }
+            }
+            if (fail) {
+              break;
+            }
+            std::string trailer = buf.substr(0, pos);
+            buf.erase(0, pos + 2);
+            if (trailer.empty()) {
+              break;
+            }
+          }
+          break;
+        }
+        while ((long)buf.size() < sz + 2) {
+          ssize_t n = read(fd, tmp, sizeof(tmp));
+          if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+              continue;
+            }
+            fail = true;
+            break;
+          }
+          buf.append(tmp, (size_t)n);
+        }
+        if (fail) {
+          break;
+        }
+        if ((long)req.body.size() + sz > (long)m_opt.max_body_bytes) {
+          fail = true;
+          break;
+        }
+        req.body.append(buf, 0, (size_t)sz);
+        buf.erase(0, (size_t)sz);
+        if (buf.size() < 2 || buf.compare(0, 2, "\r\n") != 0) {
+          fail = true;
+          break;
+        }
+        buf.erase(0, 2);
+      }
+      if (fail) {
+        SocketWriter w(fd, false);
+        w.write_full(400, "{\"error\":{\"code\":400,\"message\":\"malformed chunked request body\"}}",
+                     "application/json");
         goto done;
       }
-      buf.append(tmp, (size_t)n);
+    } else {
+      while ((long)buf.size() < clen) {
+        ssize_t n = read(fd, tmp, sizeof(tmp));
+        if (n <= 0) {
+          if (n < 0 && errno == EINTR) {
+            continue;
+          }
+          goto done;
+        }
+        buf.append(tmp, (size_t)n);
+      }
+      req.body = buf.substr(0, (size_t)clen);
+      buf.erase(0, (size_t)clen);
     }
-    req.body = buf.substr(0, (size_t)clen);
-    buf.erase(0, (size_t)clen);
 
     SocketWriter w(fd, keep_alive);
     try {

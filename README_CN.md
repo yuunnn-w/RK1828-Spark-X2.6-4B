@@ -25,7 +25,8 @@
 | Prefill 吞吐 | 647 tok/s（88 token，137 ms）→ 788（4.3k）→ 685（14.8k）→ 约 460（38k） |
 | 精度（392 题留出集，贪心 + thinking on） | 可判分 332 题，正确 **99 = 29.8 %**（该轮测于修复 system 送达路径之前，见 `docs/benchmarks.md` §2 / §6.2）；GRQ w4a16 与 bf16 原模型逐 token top-1 一致率 **96.16 %**，留出集 PPL 1.2451（bf16 为 1.2536） |
 | 复读 | 392 题里**真实复读 0 条**；48 组对抗性 prompt 里 runaway 2 组（都是 prompt 明确要求"重复这段话"）；熔断三层默认开启，误伤时可调 |
-| 工具调用 | 打通：`finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 `tools` 时不会伪造（官方 function-call 示例 8 题命中 4） |
+| 工具调用 | 打通：`finish_reason=tool_calls`、`arguments` 可 JSON 解析、不给 `tools` 时不会伪造（官方 function-call 示例 8 题命中 4）；流式按 OpenAI 规范增量下发，`tool_choice=required` 生效 |
+| 多轮 KV 复用 | 4 个槽位放在内存盘里；同一会话第二轮（1214 token）prefill 从 1214 降到 **18 token**，槽位开/关的贪心输出逐字节一致 |
 | 压力/兼容性 | 31 项套件 **失败 1**（唯一失败是模型行为，不是服务缺陷，见"已知限制"）；并发 24 全成功；120 条浸泡零错误零复读 |
 | 温度 | 连续评测 + 压测期间卡 29–56 °C（被动散热），SoC 热区 ≤ 33 °C，无热节流事件 |
 
@@ -98,6 +99,8 @@ model/           download_model.sh（权重不入 git）
 # /etc/rk1828-spark.env
 TEMP=1.0 TOP_K=0 TOP_P=0.95 REPEAT_PENALTY=1.0 MAX_NEW=0
 EXTRA_ARGS="--reasoning-format deepseek"      # 思考与答案分离
+# 多会话：4 个 KV 槽位放在 11G tmpfs 里（deploy/start.sh 负责挂载）
+KV_SLOTS=4 KV_SLOT_DIR=/run/rk1828-kv KV_SLOT_TMPFS_SIZE=11G
 # 熔断误伤时：EXTRA_ARGS="... --ngram-ban-at 6 --loop-max-occurrences 4"，或 --fuse-off
 ```
 
@@ -113,9 +116,13 @@ EXTRA_ARGS="--reasoning-format deepseek"      # 思考与答案分离
 ## 已知限制（诚实清单）
 
 - **单 session 串行**：卡上模型常驻 4.9 GB，只有一个推理会话；并发体现在 HTTP 层与排队上
-  （队列超过 `--max-queue` 返回 429 + `Retry-After`）。
-- **明确拒绝 `n>1`**（返回 400，不会静默只回一条）。**未实现**：`beam_search`、多模态输入（图片/音频）、
-  `/v1/embeddings`、`audio`/`modalities`、`rknn3_session_run_async` 重叠取样。
+  （队列超过 `--max-queue` 返回 429 + `Retry-After`）。4 个 KV 槽位解决的是会话切换时的重复 prefill，
+  不是并行推理。
+- **KV 槽位要求客户端原样回放**上一轮 assistant 的 `content` 和 `reasoning_content`；回放不一致会退回
+  冷启动（结果仍正确，只是慢）。细节见 `docs/server.md` §3.2。
+- **明确拒绝 `n>1`**（返回 400，不会静默只回一条）。**已实现**：`/v1/responses`（流式+非流式）、
+  `/v1/embeddings`（词嵌入均值池化，近似嵌入）。**未实现**：`beam_search`、多模态输入（图片/音频）、
+  `audio`/`modalities`、`rknn3_session_run_async` 重叠取样。
 - **上下文长度是转换时写死的**：运行时只会把过长的请求夹回模型编译值，不会更长。
 - 一个尚未解决的模型侧行为：`thinking on` + 短预算时可能"只复述不作答"；选择题答错时可能输出重复字母
   （如 `AAAAA`）。这不是服务缺陷，但会影响端到端体验。

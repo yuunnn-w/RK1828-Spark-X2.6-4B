@@ -51,6 +51,15 @@ struct GenRequest {
   int           grammar_type = 0;  // rknn3_grammar_type
   bool          use_tools = false;
   std::string   tools_json;
+  // tool_choice 需要语法约束时为真："required" 或指定函数名 → 下发 Spark 工具调用 structural_tag
+  bool          force_tool_grammar = false;
+  std::vector<std::string> allowed_tools;  // 约束里允许出现的工具名（空 = 任意合法名）
+
+  // KV 槽位续接：cached_prefix_tokens > 0 表示卡上已缓存该 prompt 的前缀，不清 KV、不重算
+  int cached_prefix_tokens = 0;
+  bool keep_kv_after = false;  // 生成结束后不清 KV（槽位模式：由调用方保存/换入下一个会话）
+  // 带工具时放宽复读熔断：工具参数里重复的键/括号会触发 n-gram 与长块检测
+  bool relax_guard = false;
 };
 
 struct TokenProb {
@@ -60,7 +69,9 @@ struct TokenProb {
 
 struct GenResult {
   std::string text;
-  long prompt_tokens = 0;
+  long prompt_tokens = 0;        // runtime 报告的本次 prefill token 数（不含复用部分）
+  long prompt_text_tokens = 0;   // 整段 prompt 的真实 token 数（含复用部分）
+  long reused_tokens = 0;        // runtime 从卡上 KV 复用的 token 数
   long completion_tokens = 0;
   double prefill_ms = 0.0;
   double decode_ms = 0.0;
@@ -72,6 +83,10 @@ struct GenResult {
   int  ret = 0;
   std::vector<std::vector<TokenProb> > logprobs;  // 每个生成 token 的 top-N
   std::vector<int32_t> gen_tokens;               // 实际生成的 token id 序列
+  long kv_total_tokens = 0;      // runtime 报告的当前 KV 总 token 数（镜像真实长度）
+  long runtime_reused_tokens = 0;  // runtime 自己报告的 n_reuse_tokens（未加工）
+  std::vector<int32_t> prompt_token_ids;  // runtime 自己的 prompt token id（st.input_tokens 的副本）
+  bool prompt_ids_suffix = false;         // true = 该 ids 只是本次新增的后缀（KV 复用时）
 };
 
 struct EngineConfig {
@@ -96,6 +111,11 @@ struct EngineConfig {
   int  kvcache_policy = -1;   // -1=不设置(用 runtime 默认)；0=RECURRENT 1=NORMAL 256=SAVE_CHECKPOINT
   long kv_n_keep = 0;         // RECURRENT 下保留的 cache 数（有 system prompt 时 runtime 会自行取用）
   long kv_n_keep_aligned = 0;
+  // SAVE_CHECKPOINT 策略（滑窗/线性注意力模型）：复用点必须落在 checkpoint 网格上
+  int  kv_ckpt_start = 0;
+  int  kv_ckpt_interval = 128;
+  int  kv_ckpt_count = 0;     // 0 = 按 max_context_len/interval 自动算
+  int  kv_align_cfg = 0;      // 复用/截断对齐：0=自动(32；checkpoint 策略用 interval)，可强制（滑窗模型常用 128）
 };
 
 class Engine {
@@ -107,10 +127,20 @@ public:
   void shutdown();
 
   bool ready() const { return m_ready; }
+  int  kv_align() const { return m_kv_align; }
   int  model_max_ctx() const { return m_max_ctx; }
   const std::string& model_type() const { return m_model_type; }
   int  vocab_size() const { return m_vocab_size; }
   std::string token_piece(int id) const { return m_tokenizer ? m_tokenizer->TokenToPiece(id) : std::string(); }
+
+  // 用真实词表统计一段文本的 token 数（主机侧，不上卡）；用于 prompt 预算与 KV 槽位前缀匹配
+  int count_tokens(const std::string& text) const;
+  // 把文本编码成 token 序列（用于槽位前缀指纹）；n_max 为上限
+  int encode_tokens(const std::string& text, std::vector<int32_t>& out) const;
+  // 把 token 序列的 [from,to) 段还原成文本（用于 KV 截断后续写）
+  std::string decode_range(const std::vector<int32_t>& ids, int from, int to) const;
+  // 词嵌入表的均值池化 + L2 归一化（近似嵌入，不是训练过的 embedding 模型）
+  bool embed_mean(const std::string& text, std::vector<float>& out) const;
 
   // 生成一次；线程安全由调用方保证（同一时刻只允许一个 generate）
   int generate(const GenRequest& req, GenResult& out, TextSink* sink);
@@ -119,6 +149,8 @@ public:
   int clear_kvcache();
   int save_kvcache(const std::string& path);
   int load_kvcache(const std::string& path);
+  // 把卡上的 KV 截断到前 n_tokens 个 token（RKNN3_KVCACHE_KEEP_N_TOKENS）
+  int truncate_kvcache(uint32_t n_tokens);
   int stop_generation();
   int pause_session();
   int resume_session();
@@ -164,6 +196,7 @@ public:
   VocabInfo m_vocab;
   bool m_grammar_ready = false;
   int m_max_ctx = 0;
+  int m_kv_align = 32;
   int m_eos_id = 1;
   int m_linefeed_id = -1;
   bool m_ready = false;
@@ -194,6 +227,14 @@ public:
   long m_first_token_t = 0;
   long m_deadline = 0;
   std::string m_out;
+  size_t m_sent_len = 0;    // 已推送给 sink 的字节数（stop 截断后不再补发）
+  size_t m_stop_scan = 0;   // stop 串扫描水位
+  int m_prompt_tok = 0;     // 本次 prompt 的真实 token 数（tokenizer 回调记录）
+  std::string m_tmpl_sys, m_tmpl_pre, m_tmpl_post;  // 已下发的 chat 模板（变化才重设，避免重置 KV）
+  bool m_tmpl_valid = false;
+  std::string m_tools_sent;      // 已下发的工具定义
+  std::string m_grammar_sent;    // 已下发的 grammar
+  int m_grammar_type_sent = -1;
   std::string m_last_piece;       // 用于重复行检测
   int m_repeat_line_run = 0;
 };

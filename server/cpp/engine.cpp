@@ -374,14 +374,33 @@ int Engine::init(const EngineConfig& cfg) {
     memset(&kvp, 0, sizeof(kvp));
     kvp.recurrent.n_keep = (int64_t)m_cfg.kv_n_keep;
     kvp.recurrent.n_keep_aligned = (int64_t)m_cfg.kv_n_keep_aligned;
+    kvp.save_checkpoint.checkpoint_start_pos = (int64_t)m_cfg.kv_ckpt_start;
+    kvp.save_checkpoint.checkpoint_interval = (int64_t)m_cfg.kv_ckpt_interval;
+    int64_t room = (int64_t)(m_max_ctx > 0 ? m_max_ctx : m_llm_config.max_ctx_len) - m_cfg.kv_ckpt_start;
+    int64_t max_cnt = m_cfg.kv_ckpt_interval > 0 ? room / m_cfg.kv_ckpt_interval : 0;
+    int64_t want = m_cfg.kv_ckpt_count > 0 ? m_cfg.kv_ckpt_count : max_cnt;
+    if (want > max_cnt) {
+      want = max_cnt;
+    }
+    kvp.save_checkpoint.max_checkpoint_count = want;
+    kvp.save_checkpoint.checkpoint_tail_overwrite = false;
     ret = rknn3_session_set_kvcache_policy(m_sess, (rknn3_kvcache_policy)m_cfg.kvcache_policy, &kvp);
     if (ret != RKNN3_SUCCESS) {
       LOGE("set kvcache policy %d fail ret=%d", m_cfg.kvcache_policy, ret);
       return ret;
     }
-    LOGN("kvcache policy=%d n_keep=%ld aligned=%ld", m_cfg.kvcache_policy, (long)m_cfg.kv_n_keep,
-         (long)m_cfg.kv_n_keep_aligned);
+    if (m_cfg.kvcache_policy == RKNN3_KVCACHE_POLICY_SAVE_CHECKPOINT) {
+      m_kv_align = m_cfg.kv_ckpt_interval > 0 ? m_cfg.kv_ckpt_interval : 128;
+    }
+    LOGN("kvcache policy=%d n_keep=%ld aligned=%ld ckpt(start=%d interval=%d count=%ld) kv_align=%d",
+         m_cfg.kvcache_policy, (long)m_cfg.kv_n_keep, (long)m_cfg.kv_n_keep_aligned, m_cfg.kv_ckpt_start,
+         m_cfg.kv_ckpt_interval, (long)want, m_kv_align);
   }
+
+  if (m_cfg.kv_align_cfg > 0) {
+    m_kv_align = m_cfg.kv_align_cfg;
+  }
+  LOGN("kv align = %d tokens", m_kv_align);
 
   // 语法约束（response_format）需要 context 级 grammar 初始化
   {
@@ -428,6 +447,9 @@ int Engine::cb_tokenizer(void* ud, const char* text, int32_t len, int32_t* token
     return n;
   }
   e->m_hist.assign(tokens, tokens + n);
+  if (n > e->m_prompt_tok) {
+    e->m_prompt_tok = n;  // 整段 prompt 的真实 token 数（KV 复用时的 prefill 数会小于它）
+  }
   return n;
 }
 
@@ -744,7 +766,7 @@ int Engine::cb_sampling(void* ud, float16* logits, char* logits_name) {
   int tok = e->sample_token(logits, e->m_vocab_size);
   // n-gram 复读检测：候选 token 若会让某个已经出现多次的 n-gram 再次闭合，就禁掉重选。
   // 这补上了周期检测的盲区——"措辞略变但整段复述"的复读没有固定周期，周期检测抓不到。
-  const bool ngram_on = (e->m_cfg.ngram_len > 1 && e->m_cfg.ngram_ban_at > 0);
+  const bool ngram_on = (e->m_cfg.ngram_len > 1 && e->m_cfg.ngram_ban_at > 0 && !e->m_req.relax_guard);
   for (int attempt = 0; ngram_on && attempt < 3; ++attempt) {
     if (tok < 0) {
       break;
@@ -788,7 +810,9 @@ void Engine::note_text(const std::string& piece) {
   }
   if (piece == m_last_piece) {
     ++m_repeat_line_run;
-    if (m_repeat_line_run >= 6) {  // 同一片段连续 6 次：判定复读，收尾
+    // 带工具时参数 JSON 里相同的键值片段会被连续产出，阈值放宽一倍
+    const int run_limit = m_req.relax_guard ? 12 : 6;
+    if (m_repeat_line_run >= run_limit) {  // 同一片段连续 N 次：判定复读，收尾
       m_force_stop = true;
       ++m_loop_hits;
       if (m_res) {
@@ -802,6 +826,7 @@ void Engine::note_text(const std::string& piece) {
   // 长块复读检测：输出每增长若干字节就取一段尾部文本，看它在全文里出现了几次。
   // 典型失效模式是"整块自我复述"（周期上百 token），只靠 token 级周期检测容易漏。
   const size_t W = (size_t)m_cfg.loop_window_bytes;
+  const int occ_limit = m_req.relax_guard ? m_cfg.loop_max_occurrences + 3 : m_cfg.loop_max_occurrences;
   if (m_cfg.loop_max_occurrences > 0 && m_out.size() >= (size_t)m_cfg.loop_check_min_bytes &&
       m_out.size() >= m_next_loop_check) {
     std::string tail = m_out.substr(m_out.size() - W);
@@ -809,7 +834,7 @@ void Engine::note_text(const std::string& piece) {
     for (size_t pos = 0; (pos = m_out.find(tail, pos)) != std::string::npos; pos += 1) {
       ++occ;
     }
-    if (occ >= m_cfg.loop_max_occurrences) {
+    if (occ >= occ_limit) {
       m_force_stop = true;
       ++m_loop_hits;
       if (m_res) {
@@ -916,24 +941,119 @@ int Engine::cb_result(void* ud, RKLLMResult* result, LLMCallState state) {
   if (piece.empty()) {
     return 0;
   }
+  size_t prev_len = e->m_out.size();
   e->m_out += piece;
   e->note_text(piece);
-  // 命中 stop 串：截断并停止生成
+
+  // stop 串：在整段输出里查找（不是只看末尾），命中就截断并立刻停止生成。
+  size_t cut = std::string::npos;
+  size_t max_stop = 0;
   for (size_t i = 0; i < e->m_req.stop_strings.size(); ++i) {
     const std::string& s = e->m_req.stop_strings[i];
-    if (!s.empty() && e->m_out.size() >= s.size() &&
-        e->m_out.compare(e->m_out.size() - s.size(), s.size(), s) == 0) {
-      e->m_out.erase(e->m_out.size() - s.size());
-      e->m_stop_hit = true;
+    if (s.empty()) {
+      continue;
+    }
+    if (s.size() > max_stop) {
+      max_stop = s.size();
+    }
+    // 允许匹配跨越本次片段边界：从上一轮水位往回退 |s|-1 个字符重新扫描
+    size_t scan = (e->m_stop_scan > s.size() - 1) ? e->m_stop_scan - (s.size() - 1) : 0;
+    size_t pos = e->m_out.find(s, scan);
+    if (pos != std::string::npos && (cut == std::string::npos || pos < cut)) {
+      cut = pos;
     }
   }
-  if (e->m_sink) {
-    if (!e->m_sink->on_text(piece)) {
+  if (cut != std::string::npos) {
+    e->m_out.erase(e->m_out.begin() + cut, e->m_out.end());
+    e->m_stop_scan = cut;
+    e->m_stop_hit = true;
+    e->m_force_stop = true;  // 下一轮采样直接返回 EOS，不再继续生成
+  }
+
+  // 有 stop 串时把"|s|-1"个字符押后发送，跨越边界的 stop 才不会漏进正文
+  size_t flush_upto = e->m_out.size();
+  if (!e->m_stop_hit && max_stop > 1) {
+    flush_upto = flush_upto > max_stop - 1 ? flush_upto - (max_stop - 1) : 0;
+  }
+  if (e->m_sink && flush_upto > e->m_sent_len) {
+    std::string send = e->m_out.substr(e->m_sent_len, flush_upto - e->m_sent_len);
+    e->m_sent_len = flush_upto;
+    if (!send.empty() && !e->m_sink->on_text(send)) {
       e->m_client_gone = true;
       return 0;
     }
+  } else if (e->m_stop_hit) {
+    e->m_sent_len = e->m_out.size();
   }
   return 0;
+}
+
+// ------------------------------------------------------------------ 主机侧 token 统计
+int Engine::encode_tokens(const std::string& text, std::vector<int32_t>& out) const {
+  out.clear();
+  if (!m_ready || !m_tokenizer || text.empty()) {
+    return 0;
+  }
+  const int cap = m_max_ctx > 0 ? m_max_ctx : 8192;
+  std::vector<int32_t> buf((size_t)cap, 0);
+  int n = m_tokenizer->Tokenize(text.c_str(), (int32_t)text.size(), buf.data(), cap);
+  if (n <= 0) {
+    return 0;
+  }
+  buf.resize((size_t)n);
+  out.swap(buf);
+  return n;
+}
+
+std::string Engine::decode_range(const std::vector<int32_t>& ids, int from, int to) const {
+  if (!m_tokenizer || from < 0 || to > (int)ids.size() || from >= to) {
+    return std::string();
+  }
+  std::vector<int32_t> part(ids.begin() + from, ids.begin() + to);
+  return m_tokenizer->Decode(part.data(), (int)part.size());
+}
+
+int Engine::count_tokens(const std::string& text) const {
+  std::vector<int32_t> unused;
+  return encode_tokens(text, unused);
+}
+
+bool Engine::embed_mean(const std::string& text, std::vector<float>& out) const {
+  out.clear();
+  if (!m_ready || !m_embed || m_embedding_dim <= 0 || text.empty()) {
+    return false;
+  }
+  std::vector<int32_t> toks;
+  if (encode_tokens(text, toks) <= 0) {
+    return false;
+  }
+  std::vector<double> acc((size_t)m_embedding_dim, 0.0);
+  int n = 0;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    int id = toks[i];
+    if (id < 0 || id >= m_vocab_size) {
+      continue;
+    }
+    const float16* row = m_embed + (size_t)id * (size_t)m_embedding_dim;
+    for (int d = 0; d < m_embedding_dim; ++d) {
+      acc[(size_t)d] += (double)fp16_to_fp32(row[d]);
+    }
+    ++n;
+  }
+  if (n == 0) {
+    return false;
+  }
+  double norm = 0.0;
+  for (int d = 0; d < m_embedding_dim; ++d) {
+    acc[(size_t)d] /= (double)n;
+    norm += acc[(size_t)d] * acc[(size_t)d];
+  }
+  norm = std::sqrt(norm);
+  out.resize((size_t)m_embedding_dim);
+  for (int d = 0; d < m_embedding_dim; ++d) {
+    out[(size_t)d] = norm > 1e-12 ? (float)(acc[(size_t)d] / norm) : 0.0f;
+  }
+  return true;
 }
 
 // ------------------------------------------------------------------ 生成
@@ -966,6 +1086,9 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
   out.logprobs.clear();
   m_last_piece.clear();
   m_repeat_line_run = 0;
+  m_sent_len = 0;
+  m_stop_scan = 0;
+  m_prompt_tok = 0;
   m_client_gone = false;
   m_force_stop = false;
   m_stop_hit = false;
@@ -980,38 +1103,65 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
   out = GenResult();
   out.ret = 0;
 
-  int ret = rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_CLEAR_ALL, nullptr);
-  if (ret != RKNN3_SUCCESS) {
-    LOGN("clear kvcache ret=%d (ignored)", ret);
+  int ret = RKNN3_SUCCESS;
+  if (req.cached_prefix_tokens > 0) {
+    // KV 槽位命中：卡上已经是这个会话的内容，不清 KV、不重算这段前缀
+    LOGN("kv reuse: keep %d cached prefix tokens (no clear)", req.cached_prefix_tokens);
+  } else {
+    ret = rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_CLEAR_ALL, nullptr);
+    if (ret != RKNN3_SUCCESS) {
+      LOGN("clear kvcache ret=%d (ignored)", ret);
+    }
   }
-  ret = rknn3_session_set_chat_template(m_sess, req.system_prompt.c_str(), req.prompt_prefix.c_str(),
-                                        req.prompt_postfix.c_str());
-  if (ret != RKNN3_SUCCESS) {
-    LOGE("set chat template fail ret=%d", ret);
-    out.ret = ret;
-    return ret;
+  // 模板/工具/grammar 只在变化时下发：每次重设可能让 runtime 重置会话状态（含 KV）
+  if (!m_tmpl_valid || req.system_prompt != m_tmpl_sys || req.prompt_prefix != m_tmpl_pre ||
+      req.prompt_postfix != m_tmpl_post) {
+    ret = rknn3_session_set_chat_template(m_sess, req.system_prompt.c_str(), req.prompt_prefix.c_str(),
+                                          req.prompt_postfix.c_str());
+    if (ret != RKNN3_SUCCESS) {
+      LOGE("set chat template fail ret=%d", ret);
+      out.ret = ret;
+      return ret;
+    }
+    m_tmpl_sys = req.system_prompt;
+    m_tmpl_pre = req.prompt_prefix;
+    m_tmpl_post = req.prompt_postfix;
+    m_tmpl_valid = true;
   }
   if (m_grammar_ready) {
     if (req.use_grammar) {
-      ret = rknn3_session_set_grammar(m_sess, req.grammar_str.empty() ? nullptr : req.grammar_str.c_str(),
-                                      (rknn3_grammar_type)req.grammar_type, NULL);
-      if (ret != 0) {
-        LOGN("set grammar fail ret=%d (忽略约束)", ret);
+      if (!m_tmpl_valid || req.grammar_str != m_grammar_sent || req.grammar_type != m_grammar_type_sent) {
+        ret = rknn3_session_set_grammar(m_sess, req.grammar_str.empty() ? nullptr : req.grammar_str.c_str(),
+                                        (rknn3_grammar_type)req.grammar_type, NULL);
+        if (ret != 0) {
+          LOGN("set grammar fail ret=%d (忽略约束)", ret);
+        } else {
+          m_grammar_sent = req.grammar_str;
+          m_grammar_type_sent = req.grammar_type;
+        }
       }
-    } else {
+    } else if (!m_grammar_sent.empty() || m_grammar_type_sent >= 0) {
       rknn3_session_clear_grammar(m_sess);
+      m_grammar_sent.clear();
+      m_grammar_type_sent = -1;
     }
   }
-  // runtime 没有"清除工具"的接口：每请求显式覆盖，避免上一个请求的工具定义残留
+  // runtime 没有"清除工具"的接口：变化时才覆盖，避免无谓地重置会话状态
   if (req.use_tools && !req.tools_json.empty()) {
-    ret = rknn3_session_set_function_tools(m_sess, req.tools_json.c_str());
-    if (ret != 0) {
-      LOGN("set function tools fail ret=%d", ret);
+    if (req.tools_json != m_tools_sent) {
+      ret = rknn3_session_set_function_tools(m_sess, req.tools_json.c_str());
+      if (ret != 0) {
+        LOGN("set function tools fail ret=%d", ret);
+      } else {
+        m_tools_sent = req.tools_json;
+      }
     }
-  } else {
+  } else if (!m_tools_sent.empty()) {
     ret = rknn3_session_set_function_tools(m_sess, "[]");
     if (ret != 0) {
       LOGN("reset function tools ret=%d (ignored)", ret);
+    } else {
+      m_tools_sent.clear();
     }
   }
 
@@ -1056,12 +1206,17 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
 
   rknn3_llm_infer_param ip;
   memset(&ip, 0, sizeof(ip));
-  ip.keep_history = 0;
+  // 槽位命中时卡上已经有这段会话的 KV：keep_history=1 让 runtime 在既有 KV 上续写，
+  // 而不是按"新会话"把历史丢掉（实测 keep_history=0 时 reuse 恒为 0、total 只剩本轮）。
+  ip.keep_history = (req.cached_prefix_tokens > 0) ? 1 : 0;
   if (req.max_new_tokens > 0) {
     ip.max_new_tokens = req.max_new_tokens;
   } else {
-    // "不限制"：给到会话的上下文窗口长度，实际由 EOS 或剩余窗口收尾（官方 -n -1 同义）
+    // "不限制"：给到会话剩余的上下文窗口长度，实际由 EOS 或剩余窗口收尾（官方 -n -1 同义）
     int room = m_max_ctx > 0 ? m_max_ctx : m_llm_config.max_ctx_len;
+    if (req.cached_prefix_tokens > 0 && room > req.cached_prefix_tokens) {
+      room -= req.cached_prefix_tokens;  // 卡上已缓存的前缀占掉的窗口
+    }
     if (room < 128) {
       room = 128;
     }
@@ -1076,12 +1231,54 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
     LOGE("rknn3_session_run fail ret=%d", ret);
   }
 
+  // 把押后发送的尾部片段冲给客户端（没命中 stop 时正文才是完整的）
+  if (m_sink && !m_stop_hit && m_out.size() > m_sent_len) {
+    std::string send = m_out.substr(m_sent_len);
+    m_sent_len = m_out.size();
+    if (!send.empty() && !m_sink->on_text(send)) {
+      m_client_gone = true;
+    }
+  }
+
   RKLLMRunState st;
   memset(&st, 0, sizeof(st));
+  long n_prefill = 0, n_reuse = 0, n_total = 0;
   if (rknn3_session_query_state(m_sess, &st) == RKNN3_SUCCESS) {
-    out.prompt_tokens = (long)st.n_prefill_tokens;
+    n_prefill = (long)st.n_prefill_tokens;
+    n_reuse = (long)st.n_reuse_tokens;
+    n_total = (long)st.n_total_tokens;
     out.completion_tokens = (long)st.n_decode_tokens;
   }
+  LOGN("state: prefill=%ld reuse=%ld decode=%ld total=%ld in=%llu out=%llu", n_prefill, n_reuse,
+       (long)st.n_decode_tokens, n_total, (unsigned long long)st.n_input_tokens,
+       (unsigned long long)st.n_output_tokens);
+  if (st.input_tokens && st.n_input_tokens > 0) {
+    LOGN("input_ids: n=%llu first=%d,%d,%d last=%d", (unsigned long long)st.n_input_tokens,
+         st.n_input_tokens > 0 ? st.input_tokens[0] : -1, st.n_input_tokens > 1 ? st.input_tokens[1] : -1,
+         st.n_input_tokens > 2 ? st.input_tokens[2] : -1,
+         st.n_input_tokens > 0 ? st.input_tokens[st.n_input_tokens - 1] : -1);
+  }
+  out.kv_total_tokens = n_total;
+  out.runtime_reused_tokens = n_reuse;
+  if (st.input_tokens && st.n_input_tokens > 0 && st.n_input_tokens < 1000000) {
+    out.prompt_token_ids.assign(st.input_tokens, st.input_tokens + st.n_input_tokens);
+    out.prompt_ids_suffix = (req.cached_prefix_tokens > 0 && (long)st.n_input_tokens == n_prefill);
+    // runtime 自己的 token 数是权威值：主机分词器与它可能不一致（特殊标记）
+    out.prompt_tokens = out.prompt_ids_suffix ? (long)req.cached_prefix_tokens + (long)st.n_input_tokens
+                                              : (long)st.n_input_tokens;
+  }
+  // 本次实际送进去的文本 token 数（tokenizer 回调记录；runtime 分块调用时取最大值）
+  long sent_tok = (long)m_prompt_tok;
+  if (sent_tok <= 0) {
+    sent_tok = n_prefill;  // 兜底
+  }
+  out.reused_tokens = req.cached_prefix_tokens > 0 ? (long)req.cached_prefix_tokens : n_reuse;
+  out.prompt_tokens = (long)req.cached_prefix_tokens + sent_tok;
+  // runtime 自己报告的 prefill+reuse 更大时以它为准（例如 runtime 内部做了前缀匹配）
+  if (out.prompt_tokens < n_prefill + n_reuse) {
+    out.prompt_tokens = n_prefill + n_reuse;
+  }
+  out.prompt_text_tokens = out.prompt_tokens;
 
   long ft = m_first_token_t ? m_first_token_t : t1;
   out.prefill_ms = (double)(ft - m_t0) / 1000.0;
@@ -1115,7 +1312,9 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
     out.finish_reason = "error";
   }
 
-  rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_CLEAR_ALL, nullptr);
+  if (!req.keep_kv_after) {
+    rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_CLEAR_ALL, nullptr);
+  }
   if (m_grammar_ready) {
     rknn3_session_clear_grammar(m_sess);
   }
@@ -1125,6 +1324,15 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
 }
 
 int Engine::clear_kvcache() { return m_sess ? rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_CLEAR_ALL, nullptr) : -1; }
+int Engine::truncate_kvcache(uint32_t n_tokens) {
+  if (!m_sess) {
+    return -1;
+  }
+  rknn3_kvcache_clear_policy_param p;
+  memset(&p, 0, sizeof(p));
+  p.keep_n_tokens.n_tokens = n_tokens;
+  return rknn3_session_clear_kvcache(m_sess, RKNN3_KVCACHE_KEEP_N_TOKENS, &p);
+}
 int Engine::save_kvcache(const std::string& path) { return m_sess ? rknn3_session_save_kvcache(m_sess, path.c_str()) : -1; }
 int Engine::load_kvcache(const std::string& path) {
   return m_sess ? rknn3_session_load_kvcache_from_path(m_sess, path.c_str()) : -1;

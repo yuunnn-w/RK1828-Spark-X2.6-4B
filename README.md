@@ -30,7 +30,8 @@ English README; the Chinese one ([`README_CN.md`](README_CN.md)) is the primary 
 | Prefill | 647 tok/s (88 tok, 137 ms) → 788 (4.3k) → 685 (14.8k) → ~460 (38k) |
 | Accuracy (392 held-out items, greedy + thinking) | 99 / 332 scoreable = **29.8 %** (measured before the system-prompt-delivery fix, see `docs/benchmarks.md` §2 / §6.2); GRQ w4a16 vs bf16 teacher-forced top-1 agreement **96.16 %**, held-out PPL 1.2451 vs 1.2536 (bf16) |
 | Repetition | **0 genuine degeneration** in 392 items; 2 of 48 adversarial cases run away (both are prompts that literally demand repetition) |
-| Tool calling | Working: `finish_reason=tool_calls`, parseable `arguments`, no fabricated calls when `tools` is absent (4/8 on the official function-calling examples) |
+| Tool calling | Working: `finish_reason=tool_calls`, parseable `arguments`, no fabricated calls when `tools` is absent (4/8 on the official function-calling examples); streaming deltas follow the OpenAI spec and `tool_choice=required` is enforced |
+| Multi-turn KV reuse | 4 slots kept in RAM; second turn of a 1214-token conversation prefills only **18 tokens** instead of 1214, with byte-identical greedy output vs. slots off |
 | Stress/compat | 31-item suite: **1 failure** (a model behaviour, not a server defect); 24 concurrent requests all succeed; 120-request soak with zero errors |
 | Thermals | Card 29–56 °C during continuous eval + stress (passive cooling); SoC zones ≤ 33 °C; no throttling events |
 
@@ -109,9 +110,13 @@ Three measured rules of thumb:
 ## Known limitations (honest list)
 
 - **Single session, requests are serialized**: the model occupies 4.9 GB of the card, so concurrency is HTTP-level
-  plus queueing (429 + `Retry-After` beyond `--max-queue`).
-- **Explicitly rejected**: `n>1` (400, never silently one result). **Not implemented**: `beam_search`,
-  multimodal input, `/v1/embeddings`, audio, async overlap sampling.
+  plus queueing (429 + `Retry-After` beyond `--max-queue`). The 4 KV slots avoid re-prefilling when switching
+  between conversations; they do not make inference parallel.
+- **KV slots require the client to replay** the previous assistant `content` and `reasoning_content` verbatim;
+  otherwise the request falls back to a cold start (still correct, just slower). See `docs/server.md` §3.2.
+- **Explicitly rejected**: `n>1` (400, never silently one result). **Implemented**: `/v1/responses`
+  (streaming + non-streaming), `/v1/embeddings` (mean-pooled token embeddings, approximate).
+  **Not implemented**: `beam_search`, multimodal input, audio, async overlap sampling.
 - Context length is fixed at conversion time; the runtime clamps longer requests instead of failing.
 - Open model-side behaviours (verbose answer channel with thinking on; repeated letters on some multiple-choice
   answers) are documented rather than hidden.

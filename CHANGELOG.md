@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.1.0 — 2026-11-27
+
+面向 Agent 客户端的协议对齐、`/v1/responses` 和 4 槽 KV 复用。数字仍来自真机（OrangePi5Max + RK1828，固件 1.2.0）。
+
+### 新增
+
+- **流式工具调用按 OpenAI 规范增量下发**：首片带 `index/id/type/function.name`（`arguments` 为空串），
+  后续片只带 `index` + `arguments` 片段；工具标记不再漏进 `content`，有调用时非流式 `content` 为 `null`。
+  工具解析只作用于答案通道（`reasoning_content` 里转述的工具语法不会被误判）。
+  `content`/`reasoning_content` 里的模板标记在开启槽位时不做裁剪（见下面"KV 槽位"）。
+- **`tool_choice` 生效**：`required`、`{"type":"function","function":{"name":...}}` 用 `structural_tag`
+  约束工具调用外层结构（可用 `--tool-grammar on|off` 关闭）；`parallel_tool_calls:false` 会在工具说明里
+  加"只发一个调用"的约束。
+- **`/v1/responses`**（流式 + 非流式）：`instructions`、`input`（字符串或 item 数组）、扁平 `tools`、
+  `max_output_tokens`、`reasoning.effort`、`text.format`；事件包括 `response.created`、
+  `response.output_item.added/done`、`response.output_text.delta/done`、`response.function_call_arguments.delta/done`、
+  `response.completed`。DeepSeek Harness 的 `openai-responses` 路由可直接接。
+- **`/v1/embeddings`**：词嵌入表均值池化 + L2 归一化（本模型 2560 维）。只是近似嵌入，不是训练过的
+  embedding 模型，够做粗粒度检索/去重。
+- **HTTP 细节**：支持 chunked 请求体；`OPTIONS` 带 `Allow-Methods/Allow-Headers/Max-Age`；
+  `/health`、`/healthz` 不要求 api-key（其余端点仍校验）。
+- **`/v1/models` 元数据**：补 `properties.context_length`、`capabilities`、`supported_parameters`、
+  `system_fingerprint`，`meta` 里带 KV 槽位配置与 `kv_reuse_probe`。
+- **KV 槽位分页（`--kv-slots 4`）**：每个会话的 KV 存成主机内存镜像（`/run/rk1828-kv`，11G tmpfs），
+  卡上只放活跃槽。命中条件是"新提示词以该槽的上次提示词 + 原始生成文本开头"，命中后只送新增的一轮；
+  卡上是别的槽时先存后 load；未命中且槽满按 LRU 清理；单槽 2560 MB、总量 10240 MB 预算，超出丢镜像。
+  启动时做一次 save→load→续接自检，runtime 不支持就自动关闭槽位。
+- **FIFO 排队**：请求按到达顺序拿卡（标准 `std::mutex` 不保证公平）。
+- **`tools/protocol_check.py`**：13 项协议验收（流式工具调用、`content=null`、`tool_choice`、`stop` 句中截断、
+  `response_format` 400、chunked、CORS、`/v1/responses`、多轮槽位），支持 `--save` / `--compare`。
+
+### 修复
+
+- **每轮重设 chat template / 工具 / grammar 会清空 runtime 的 KV**，导致 `load_kvcache` 后 `n_reuse_tokens`
+  恒为 0。现在这些设置只在内容变化时下发，KV 复用才成立（同一会话第二轮 prefill 1214 → 18 token）。
+- `stop` 从"只看输出末尾"改成整段任意位置匹配，跨 SSE 片段也能命中。
+- `tool_call.id` 改为全请求唯一（`call_<seq>_<12hex>`）。
+- prompt 预算改用真实词表计数，超窗返回 400 + `context_length_exceeded`，不再按字符数估算。
+- `include_usage` 的尾块改为 `choices: []` + `usage`（OpenAI 规范）。
+- `response_format` 未知 `type` 返回 400；思考模式下用 `structural_tag` 把思考段和约束段合成一份 grammar。
+- 带 `tools` 时放宽复读熔断（工具参数里重复的键/括号不再误触发）。
+
+### 实测
+
+- 协议验收 13/13 通过（槽位开、关各跑一遍）。
+- 多轮 KV：同一会话第二轮 `reuse=1214, prefill=18`；A/B 两个会话交替切换答案正确；槽位开/关的贪心输出
+  逐字节一致。
+- 镜像大小 ≈ 78 MB + 31 KB/token（1.2k token 约 110 MB，5.9k 约 261 MB，64K 约 2.4 GB）；
+  保存 0.4–1.0 s，加载约 0.2 s（tmpfs）。
+- 滑窗 KV 的续接点必须正好在镜像末尾；截断到中间位置需要 checkpoint，1.2.0 默认策略下会报
+  `can not find the kvcache_checkpoint`。
+
+### 已知限制
+
+- 单 session，推理仍严格串行；4 个槽位解决的是会话切换的重复 prefill，不是并行推理。
+- 槽位命中要求客户端原样回放上一轮的 `content` 与 `reasoning_content`；回放不一致会冷启动（结果正确，只是慢）。
+- 工具调用轮次如果客户端回放的 `tool_calls` 重新序列化后与原始生成文本不一致，也会冷启动。
+- `/v1/embeddings` 是均值池化近似，不保证语义效果。
+
 ## v1.0.0 — 2026-11-10
 
 首个公开发布版本。全部数字来自真机（OrangePi5Max + RK1828 M.2，固件 1.2.0）。

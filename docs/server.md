@@ -46,8 +46,15 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
     --repeat-penalty 1.0 --frequency-penalty 0.0 --presence-penalty 0.0 \
     --max-new-tokens 0 --max-new-tokens-cap 0 \
     --request-timeout-sec 1200 --max-connections 128 --max-queue 64 \
+    --kv-slots 4 --kv-slot-dir /run/rk1828-kv --kv-slot-min-tokens 1024 \
+    --stream-tools on --tool-grammar on \
     --reasoning-format deepseek
 ```
+
+KV 槽位镜像放在内存盘里。`deploy/start.sh` 会检查 `KV_SLOT_DIR`，如果它还不是 tmpfs 就按
+`KV_SLOT_TMPFS_SIZE`（默认 11G）挂一个；挂载失败则退回磁盘（能用，但保存/加载慢一个数量级）。
+镜像大小约 `78 MB + 31 KB × token 数`：1.2k token 约 110 MB，64K 约 2.4 GB。四个槽都跑满 64K
+时约 9.6 GB，所以内存盘给 11G、总预算给 10240 MB。
 
 位置参数顺序固定：`<llm.rknn> <llm.weight> <core_mask(十六进制)> <tokenizer.gguf> <embed.bin>
 <max_context_len> <rope.safetensors>`。模型加载约 45 s，期间 `/health` 返回 503。
@@ -63,10 +70,12 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 |---|---|---|
 | `POST` | `/v1/chat/completions` | 主端点。`messages`（string / 多模态数组均可，`role` 支持 `system`/`developer`(OpenAI 新版写法，等同 system)/`user`/`assistant`/`tool`/`function`(遗留，等同 tool)，`assistant.tool_calls` 会回填进上下文，`role:"tool"` 渲染成 Spark 的 `tool_call_result` 块）、`stream`、`stream_options.include_usage`、`max_tokens`/`max_completion_tokens`/`n_predict`、`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`repeat_penalty`(或 `extra_body.repeat_penalty`)、`stop`、`seed`、`logprobs`、`tools`+`tool_choice`+`parallel_tool_calls`、`response_format`(`text`/`json_object`/`json_schema`)、`chat_template_kwargs.thinking`/`enable_thinking`、`chat_template_kwargs.thinking_effort_inject`(bool，关掉官方 `thinking_effort` 文本注入)、`reasoning_format`(`deepseek`)、`reasoning_effort`(`none`/`minimal` 关闭思考，`high`/`low` 写入 system 文本)、`logit_bias`（token id → −100…+5，≤−100 即屏蔽）、`top_logprobs`（1..8）；`n>1` 明确返回 400 |
 | `POST` | `/v1/completions` | 传统补全，`prompt` 原样送入（不做 chat 包装），用于评测与低层实验 |
-| `GET` | `/v1/models`, `/v1/models/{id}` | 模型列表，`meta` 内含 `model_type`、`max_context_len`、`vocab_size`、量化方式 |
+| `POST` | `/v1/responses` | OpenAI Responses API（DeepSeek Harness 的 `openai-responses` 路由）：`instructions`、`input`（字符串或 item 数组：`message`/`function_call`/`function_call_output`）、`tools`（扁平 `{type:"function",name,parameters}`）、`tool_choice`、`max_output_tokens`、`reasoning.effort`、`text.format`、`stream`。流式事件：`response.created`、`response.output_item.added/done`、`response.content_part.added`、`response.output_text.delta/done`、`response.function_call_arguments.delta/done`、`response.completed` |
+| `POST` | `/v1/embeddings` | 词嵌入表**均值池化 + L2 归一化**的近似嵌入（不是训练过的 embedding 模型，仅供粗粒度相似度/检索兜底）；`input` 为字符串或字符串数组 |
+| `GET` | `/v1/models`, `/v1/models/{id}` | 模型列表，`properties.context_length`、`capabilities`、`supported_parameters`、`meta` 内含 `model_type`、量化方式、KV 槽位配置 |
 | `GET`/`HEAD` | `/health`, `/healthz` | 就绪探针（模型未加载完 503） |
 | `GET` | `/metrics` | Prometheus 文本；`/stats` 为同一数据的 JSON |
-| `GET` | `/v1/slots` | 单 slot 状态（idle/running） |
+| `GET` | `/v1/slots` | KV 槽位列表：空闲/在卡/已换出、镜像大小、命中次数；未开启槽位时给单 slot 状态 |
 | `POST` | `/slots/{id}/pause\|resume\|interrupt` | 对应 `rknn3_session_pause/resume/stop` |
 | `POST` | `/slots/{id}/kvcache/save\|load`、`/v1/kvcache/save\|load` | 对应 `rknn3_session_save_kvcache` / `load_kvcache_from_path`，默认目录 `/run/rknn3/kvcache` |
 | `OPTIONS` | 任意 | CORS 预检 |
@@ -79,13 +88,61 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 （runtime 的 `n_decode_tokens` 与请求上限存在 off-by-one —— 实测 `max_new_tokens=64` 时它只报 63，
 所以判 `length` 用"采样器是否选了 EOS"而不是 token 数比较；用 `--sampler runtime` 时没有采样回调，退回按 token 数判断。）
 `usage` 额外给出 `prefill_ms/decode_ms/e2e_ms/tokens_per_second`，触发过复读熔断时给
-`degeneration_veto` / `degeneration_loop` / `degeneration_guard`。
+`degeneration_veto` / `degeneration_loop` / `degeneration_guard`；槽位开启时还有
+`prompt_tokens_details.cached_tokens`、`kv_slot`、`kv_prefix_tokens`、`kv_image_loaded`。
 `reasoning_format=deepseek`（或启动参数 `--reasoning-format deepseek`，本部署默认开启）时，
 非流式在 `message` 里同时给 `reasoning_content`（思考）与 `content`（正式回答），流式给 `delta.reasoning_content`；
-模型没写出 think 闭合标记时不硬拆，整段留在 `content` 里。
+关闭思考时不产生 `reasoning_content`。模型没写出 `</think>` 时（常见于 `max_tokens` 截断），整段按思考内容放进
+`reasoning_content`，`content` 为空，与流式路径保持一致。
 
 错误同样走 OpenAI 形状：400（请求不合法）、401（api-key）、404（无路由）、413（body 过大）、
 429（推理排队超过 `--max-queue`）、500（推理失败）、503（模型未就绪/连接过多）。
+`/health` **不要求 api-key**（外部守护/探针拿不到密钥），其余端点仍校验。
+
+### 3.1 工具调用（P0 对齐项）
+
+- `tool_choice`：`auto`（默认）、`none`（等同不带工具）、`required`（强制调用）以及
+  `{"type":"function","function":{"name":...}}`（强制指定函数）。`parallel_tool_calls:false` 会在
+  system 的工具段里追加"只发一个调用"的约束。
+- 流式 `tool_calls` 按 OpenAI 规范**增量**下发：首片带 `index`/`id`/`type`/`function.name`
+  （`arguments` 为空串），后续片只带 `index` + `function.arguments` 片段，客户端自行拼接后再 `JSON.parse`。
+  工具标记不会漏进 `content`；出现工具调用时非流式 `message.content` 为 `null`、`finish_reason="tool_calls"`。
+- 工具解析只作用于**答案通道**（`reasoning_content` 里转述的工具语法不会被当成调用）。
+- `usage` 尾块（`include_usage`）按规范单独下发：`choices: []` + `usage`。
+- `stop` 是**整段输出里的任意位置**匹配（跨 SSE 片段也不会漏），命中即截断并停止生成。
+- `response_format` 只接受 `text`/`json_object`/`json_schema`，未知类型直接 400；
+  思考模式下用 `structural_tag` 把"思考段 + 约束段"合成一份 grammar
+  （`json_schema > structural_tag > grammar` 的官方优先级）。`tool_choice=required/指定函数` 且
+  `--tool-grammar on` 时同样用 `structural_tag` 约束工具调用外层结构，grammar 编译失败会退化
+  为提示词约束并写日志。
+
+### 3.2 KV 槽位分页（多会话并发）
+
+`--kv-slots 4` 开启后，服务在主机内存里保存多个会话的 KV，卡上同一时刻只放一个。
+
+一次请求的处理顺序：
+
+1. 按到达顺序排队（FIFO 票据），拿到卡后进入下一步。
+2. 在槽表里找"新提示词以某槽的『上次提示词 + 原始生成文本』开头"的槽。
+3. 命中且该槽就在卡上：直接续接，只把新增的这一轮文本送进 runtime。
+4. 命中但卡上是别的槽：先把卡上这个槽存成镜像，再 load 目标槽镜像（接在镜像末尾）。
+5. 没命中：槽没满就新开一个；满了就按 LRU 清掉最不活跃的槽，然后冷启动（清 KV、整段重算）。
+
+几条容易踩的坑（都是实测）：
+
+- **客户端必须原样回放上一轮的 `content` 和 `reasoning_content`**。开启槽位时服务端不做裁剪；
+  客户端如果丢了 reasoning 或改写了内容，就会退化成第 5 步的冷启动——结果仍然正确，只是慢。
+- Spark 是滑窗注意力，**续接点必须正好是镜像末尾**。截断到中间位置需要 checkpoint，1.2.0 默认策略
+  下没有可用 checkpoint，runtime 会报 `can not find the kvcache_checkpoint`。
+- **每轮重设 chat template / 工具 / grammar 会清空 KV**。服务只在内容变化时下发这些设置，改动这里
+  要小心。
+- 镜像目录是 `/run/rk1828-kv`（11G tmpfs，掉电即失）。单槽上限 `--kv-slot-max-image-mb`（默认 2560），
+  总预算 `--kv-slot-max-total-mb`（默认 10240）；超了按 LRU 丢镜像，不会把内存盘写满。
+- 启动时会做一次 save→load→续接自检。如果 runtime 报告 `n_reuse_tokens == 0`，槽位会自动关闭，
+  `/v1/slots` 和 `/v1/models` 里的 `kv_reuse_probe` 会显示 `unsupported`。
+
+效果：同一会话第二轮提示词 1214 token 时，prefill 从 1214 token 降到 18 token；保存镜像 0.4–1.0 s，
+加载约 0.2 s。槽位开/关两种配置下，贪心输出逐字节一致。
 
 ## 4. 采样与"不出现复读"的实现
 
@@ -195,26 +252,30 @@ journalctl -u rk1828-spark -f
 
 - 单 session（模型 KV 已占 4854/5052 MB），所有推理请求**串行排队**；并发只体现在 HTTP 层与排队上
   （排队深度超过 `--max-queue` 返回 429，`/stats` 暴露 `queued_now` / `queue_limit`）。
+  4 个 KV 槽位解决的是"多个会话来回切换时不用整段重算"，不是并行推理。
 - **明确拒绝**：`n>1`（返回 400，不会静默只回一条）。**已实现**：`logit_bias`、`top_logprobs`（1..8，贪心路径给候选排名）、
-  `reasoning_effort`、`logprobs`、`/v1/completions`、HEAD、`/v1/models/{id}`、429+`Retry-After`。
-  **未实现**：`beam_search`、多模态输入（图片/音频）、`/v1/embeddings`、`audio`/`modalities`、
+  `reasoning_effort`、`logprobs`、`/v1/completions`、HEAD、`/v1/models/{id}`、429+`Retry-After`、
+  `/v1/responses`（流式+非流式）、`/v1/embeddings`（词嵌入表均值池化，只是近似，不是训练过的 embedding 模型）。
+  **未实现**：`beam_search`、多模态输入（图片/音频）、`audio`/`modalities`、
   `--run-mode async`（`rknn3_session_run_async` 重叠取样）。
 - **性能事实（已定量）**：单流 decode ≈ 50 tok/s（短上下文，19–20 ms/token），上下文到 38k/53k token 时降到
   35 / 32 tok/s；prefill 135 ms（88 token）→ 789 tok/s（4.3k）→ 684 tok/s（14.8k）→ 约 460 tok/s（38k）→
   53166 token 用 115.6 s。**不存在"每请求固定 10 s 开销"**——`timing_probe.py` / `mt_sweep.py` 证明
   `decode_ms` 只随实际生成 token 数走，与请求的 `max_tokens` 无关；早期评测日志里那个 10 s 平台期在该构建上不可复现，
   已结案（遗留标注为当时那个实例的现象，非架构问题）。
-- **KV cache 策略不是杠杆**：默认 / 显式 RECURRENT / NORMAL 三档实测 prefill 与 decode 差异在噪声内；
-  `--kv-n-keep 2048` 直接起不来（HEALTH_FAIL）。`SAVE_CHECKPOINT` 策略未试（Spark 是滑窗注意力，官方注释说它对
-  线性/滑窗模型才生效）。
+- **KV cache 能不能复用，取决于续接点**：解锁槽位之前踩过的三个坑写在 §3.2。补充两点实测：
+  策略（默认 / RECURRENT / NORMAL）本身不是杠杆，prefill/decode 差异在噪声内；`--kv-n-keep 2048` 起不来（HEALTH_FAIL）。
+  真正决定成败的是"续接点必须正好在镜像末尾"，以及不要每轮重设 chat template/工具/grammar。
 - `tools` 已按官方 chat_template 完整打通：服务端把工具清单渲染进 system 块（`## Tools` + `<tools>` 包裹
   每个 `tool.function` 紧凑 JSON），模型输出 `<tool_call>名称 <arg_key>k</arg_key><arg_value>v</arg_value>`，
   服务端解析成规范 OpenAI `tool_calls`（`name` + 可解析的 `arguments` JSON），`finish_reason="tool_calls"`；
-  工具结果走 `<|Tool|>` 轮 + `tool_response` 成对标记回填。实测（官方 function-call 示例那套工具与 prompt）
-  命中 4/8（修复 system 送达路径前后都是 4/8：工具定义另一条路 `rknn3_session_set_function_tools()` 本来就是通的），
-  `tools` 不给时不会伪造 `tool_calls`——但模型可能在正文里自己编一段"已调用工具查询到…"的叙述，Agent 侧要自己校验。
-  模型自身的工具遵循度决定命中率。
+  工具结果走 `<|Tool|>` 轮 + `tool_response` 成对标记回填。流式按 OpenAI 规范增量下发（首片带
+  `index/id/type/function.name`，之后只带 `index` + `arguments` 片段），标记不会漏进 `content`；
+  `tool_choice` 的 `required` / 指定函数 / `parallel_tool_calls:false` 都会生效。实测（官方 function-call
+  示例那套工具与 prompt）命中 4/8，`tools` 不给时不会伪造 `tool_calls`——但模型可能在正文里自己编一段
+  "已调用工具查询到…"的叙述，Agent 侧要自己校验。模型自身的工具遵循度决定命中率。
 - `response_format` 走 runtime 的 grammar（`json_object` → BUILTIN_JSON，`json_schema` → JSON_SCHEMA）。
+  未知 `type` 直接 400；思考模式下用 `structural_tag` 把"思考段 + 约束段"合成一份 grammar。
 - 流式响应无法在同一条连接上继续 keep-alive（没有 Content-Length，靠关连接收尾）。
 - 长上下文 prefill：实测 **38006 token / 72.0 s** 与 **53166 token / 115.6 s** 单次 prefill 均成功且 needle 命中，
   逐级加压时卡健康（Online/OK、显存、温度、LnkSta）每次都复查通过。更早的"长 prefill 打挂"记录发生在
@@ -233,6 +294,9 @@ journalctl -u rk1828-spark -f
 | `REPEAT_PENALTY / FREQ / PRESENCE` | `1.0 / 0.0 / 0.0` | **不加任何重复惩罚**：代码里合法的重复结构会被惩罚器误伤 |
 | `MAX_NEW / MAX_NEW_CAP` | `0 / 0` | 输出长度不限制，靠 EOS / 上下文窗口 / 请求超时收尾 |
 | `EXTRA_ARGS` | `--reasoning-format deepseek` | 思考内容与正式回答分离，Agent 客户端只消费 `content` |
+| `KV_SLOTS / KV_SLOT_DIR` | `4 / /run/rk1828-kv` | 内存镜像 4 槽；64K×4 约 9.6 GB，tmpfs 给 11G |
+| `KV_SLOT_TMPFS_SIZE` | `11G` | `start.sh` 负责挂；挂载失败退回磁盘 |
+| `KV_SLOT_MAX_IMAGE_MB / TOTAL_MB` | `2560 / 10240` | 单槽与总量上限，超了按 LRU 丢镜像 |
 | 熔断 | 默认三层（周期 / n-gram / 长块） | 392 题评测真实复读 0 条，熔断 14 次全部为真复读；误伤时按 §4 的旋钮降级 |
 
 实践要点（已实测）：
