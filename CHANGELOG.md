@@ -2,6 +2,16 @@
 
 ## [未发布]
 
+### 新增（实验开关，默认关闭）
+
+- **`--thinking-grammar on|off` 与 `chat_template_kwargs.thinking_grammar`**：按官方 SDK 的写法给一份
+  `structural_tag`，要求"思考段 → 思考结束标记 → 自由回答"，用来消除"模型在思考通道里直接结束、`content`
+  为空"的轮次。**在 RK1828 + 固件/运行时 1.2.0 + Spark-X2.6 上实测无效，所以默认 off**：语法引擎确实在屏蔽
+  EOS（日志里能看到 `AcceptToken rejected token_id=1`），但它只作用在"最终格式"那一段，思考段的前缀不被匹配——
+  把 grammar 要求的结束标记换成无意义字符串，模型照旧写它自己的标记；给 fib 那道题加硬性 `json_schema` 约束，
+  仍然是 157 token 纯思考后结束、没有 JSON。现象、四个对照和结论写在 `docs/server.md` §4.3，开关保留是为了
+  换固件后能直接重试。
+
 ### 修复
 
 - **`top_k` 关闭时的候选上限不再取决于 `top_p`**：客户端按 OpenAI 默认传 `top_p=1.0` 时，旧实现会退回整表

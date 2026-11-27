@@ -21,6 +21,7 @@
 | `defaults_probe.py` | 服务端默认采样是否等于模型厂商推荐；`max_tokens` 不限制/截断/`-1` 语义 | — |
 | `sampling_regression.py` | 改采样实现后的对拍：同 seed 同 prompt 的输出是否逐字节一致，顺带比较默认 `top_p=0.95` 与 OpenAI 默认 `top_p=1.0` 两条路径的 decode 速度 | `[输出 json]`（默认 `results/sampling_regression.json`） |
 | `cap_check.cpp` | 候选上限的算术验证（不需要卡、不需要模型）：常见分布停在 4096、被裁掉的概率约 1e-7；分布很平时扩到整表；客户端给了 `top_k` 就按它截断 | `g++ -O2 -std=c++11 -o cap_check tools/cap_check.cpp && ./cap_check` |
+| `thinking_grammar_probe.py` | "思考段必须闭合"grammar 的对照：同一道 fib 题在 grammar on / off / 加硬性 `json_schema` 三种情况下的输出（结论见 `docs/server.md` 4.3） | `--base`、`--out` |
 | `sysprobe.py` | **system 消息有没有真的进模型**：往 system/developer 轮埋暗号、只向 user 轮提问（判 `HIT=n/6`，含一条 user 轮对照）。修复 `--system-in-prompt` 前后分别是 6/6 与 1/6 | `--base http://<host>:8080` |
 | `feat_probe.py` | 新增 OpenAI 特性（`logit_bias`、`top_logprobs`、`reasoning_effort`、429 + `Retry-After`） | — |
 | `protocol_check.py` | **OpenAI 协议验收**：流式 tool_calls 增量、`content=null`、`tool_choice=required`、`stop` 句中截断、未知 `response_format` 400、chunked、CORS、`/v1/responses`、`/v1/embeddings`、多轮 KV 槽位 | `--base`、`--slots on|off`、`--save`、`--compare a.json b.json` |

@@ -127,6 +127,10 @@ struct AppConfig {
   bool stream_tool_parse = true;
   // tool_choice=required/指定函数时用 structural_tag 语法强制结构（失败会退化为提示词约束）
   bool tool_grammar = true;
+  // thinking 开启时用 structural_tag 强制"思考段 + 结束标记 + 自由回答"这个形状。
+  // 默认 off：1.2.0 的运行时不匹配 grammar 里的思考前缀（把结束标记换成无意义字符串模型也不认；
+  // 加硬性 JSON 约束也照样在思考通道里选 EOS）。实测不能靠它消除空回答，见 docs/server.md 4.3。
+  bool thinking_grammar = false;
   // /v1/embeddings：词嵌入均值池化（近似嵌入，非训练过的 embedding 模型）
   bool embeddings = true;
 };
@@ -745,15 +749,20 @@ static bool grammar_from_response_format(const json& rf, std::string& str, int& 
   return false;
 }
 
-// 把 response_format / 强制的 tool_choice 合成一份 runtime grammar。
+// 把 response_format / 强制的 tool_choice / 思考段的结束要求合成一份 runtime grammar。
 // 官方优先级：json_schema > structural_tag > grammar；thinking 下必须把思考段包进同一份 grammar。
 static bool build_runtime_grammar(const json& rf, bool has_rf, bool thinking, const std::string& forced_tool,
-                                  bool require_tool, bool allow_tool_grammar, std::string& out, int& type) {
+                                  bool require_tool, bool allow_tool_grammar, bool allow_thinking_grammar,
+                                  std::string& out, int& type) {
   out.clear();
   type = 0;
   bool want_json = has_rf;
   bool want_tool = allow_tool_grammar && !want_json && require_tool;
-  if (!want_json && !want_tool) {
+  // 没有别的约束但开着思考：可选地只要求"思考段 -> 结束标记 -> 自由回答"。
+  // 1.2.0 实测这条不生效（运行时不匹配思考前缀），所以默认关着；留着开关是为了在新固件上重试。
+  // 现象本身见 docs/server.md 4.3。
+  bool want_think = thinking && !want_json && !want_tool && allow_thinking_grammar;
+  if (!want_json && !want_tool && !want_think) {
     return false;
   }
 
@@ -801,7 +810,7 @@ static bool build_runtime_grammar(const json& rf, bool has_rf, bool thinking, co
       e["json_schema"] = schema;
     }
     els.push_back(e);
-  } else {
+  } else if (want_tool) {
     ordered_json e;
     e["type"] = "const_string";
     e["value"] = TAG_TOOL_OPEN;
@@ -823,6 +832,13 @@ static bool build_runtime_grammar(const json& rf, bool has_rf, bool thinking, co
     t["content"] = ordered_json{{"type", "any_text"}};
     t["end"] = TAG_TOOL_CLOSE;
     els.push_back(t);
+  } else {
+    // 自由回答段：内容不设约束（允许普通正文，也允许工具调用的标记文本），
+    // 但至少要有一个字符，所以 EOS 只在思考段闭合、并且回答已经开始之后才允许。
+    ordered_json e;
+    e["type"] = "regex";
+    e["pattern"] = "[\\s\\S]+";
+    els.push_back(e);
   }
   seq["elements"] = els;
   ordered_json root;
@@ -1593,6 +1609,7 @@ struct ChatParams {
   bool want_logprobs;
   std::string effort;
   int inject_effort = -1;  // -1 = 用服务端配置；0/1 = 请求级覆盖官方 thinking_effort 注入
+  int thinking_grammar = -1;  // -1 = 用服务端配置；0/1 = 请求级覆盖"思考段必须闭合"的 grammar
   int top_logprobs = 0;
   std::vector<int32_t> lb_ids;
   std::vector<float> lb_vals;
@@ -1765,6 +1782,10 @@ static ChatParams parse_params(const json& body) {
     // 关掉官方那句 "Now the system is invoked with `thinking_effort=…`" 的注入（实测它会被某些 prompt 复述）
     if (k.contains("thinking_effort_inject")) {
       c.inject_effort = truthy(k["thinking_effort_inject"], true) ? 1 : 0;
+    }
+    // 关掉"思考段必须闭合"的 grammar（只想对照旧行为时用）
+    if (k.contains("thinking_grammar")) {
+      c.thinking_grammar = truthy(k["thinking_grammar"], true) ? 1 : 0;
     }
   }
   if (extra.is_object() && extra.contains("enable_thinking")) {
@@ -1959,9 +1980,10 @@ static void do_chat(const HttpRequest& rq, ResponseWriter& w) {
   gr.use_tools = cp.use_tools;
   gr.tools_json = cp.tools_json;
   gr.relax_guard = cp.use_tools;
+  bool think_grammar_on = (cp.thinking_grammar >= 0) ? (cp.thinking_grammar == 1) : g_cfg.thinking_grammar;
   if (build_runtime_grammar(body.contains("response_format") ? body["response_format"] : json(), cp.use_grammar,
-                            cp.thinking, cp.forced_tool, cp.require_tool, g_cfg.tool_grammar, gr.grammar_str,
-                            gr.grammar_type)) {
+                            cp.thinking, cp.forced_tool, cp.require_tool, g_cfg.tool_grammar, think_grammar_on,
+                            gr.grammar_str, gr.grammar_type)) {
     gr.use_grammar = true;
   }
 
@@ -2302,6 +2324,7 @@ static void do_models(ResponseWriter& w, const std::string& req_id) {
                                {"thinking", g_cfg.default_thinking},
                                {"reasoning_format", g_cfg.reasoning_format},
                                {"thinking_effort_inject", g_cfg.thinking_effort_inject},
+                               {"thinking_grammar", g_cfg.thinking_grammar},
                                {"system_in_prompt", g_cfg.system_in_prompt}};
   if (!g_cfg.reasoning_effort.empty()) {
     meta["sampling_defaults"]["reasoning_effort"] = g_cfg.reasoning_effort;
@@ -2716,9 +2739,10 @@ static void do_responses(const HttpRequest& rq, ResponseWriter& w) {
   gr.use_tools = cp.use_tools;
   gr.tools_json = cp.tools_json;
   gr.relax_guard = cp.use_tools;
+  bool think_grammar_on = (cp.thinking_grammar >= 0) ? (cp.thinking_grammar == 1) : g_cfg.thinking_grammar;
   if (build_runtime_grammar(cb.contains("response_format") ? cb["response_format"] : json(), cp.use_grammar,
-                            cp.thinking, cp.forced_tool, cp.require_tool, g_cfg.tool_grammar, gr.grammar_str,
-                            gr.grammar_type)) {
+                            cp.thinking, cp.forced_tool, cp.require_tool, g_cfg.tool_grammar, think_grammar_on,
+                            gr.grammar_str, gr.grammar_type)) {
     gr.use_grammar = true;
   }
 
@@ -3017,6 +3041,9 @@ static void print_usage(const char* prog) {
       "  --kv-slot-min-tokens N  前缀短于此 token 数不建镜像（默认 1024）\n"
       "  --stream-tools on|off   流式 tool_calls 增量下发（默认 on；off = 末尾整包下发，仅排障用）\n"
       "  --tool-grammar on|off   tool_choice=required/指定函数时用 structural_tag 强制结构（默认 on）\n"
+      "  --thinking-grammar on|off  思考开启时用 structural_tag 强制'思考段 -> 结束标记 -> 自由回答'\n"
+      "                          （默认 off：1.2.0 运行时不匹配思考前缀，实测无效，见 docs/server.md 4.3）。\n"
+      "                          请求级可用 chat_template_kwargs.thinking_grammar 覆盖\n"
       "  --embeddings on|off     /v1/embeddings（词嵌入均值池化；默认 on）\n"
       "  --device-id ID          指定卡（默认第一张）\n"
       "  --log-dir DIR           日志目录（保留参数）\n",
@@ -3087,6 +3114,7 @@ int main(int argc, char** argv) {
     else if (a == "--kv-slot-max-total-mb") { g_cfg.kv_slot_max_total_mb = atoi(v.c_str()); ++i; }
     else if (a == "--stream-tools") { g_cfg.stream_tool_parse = (v == "on" || v == "1" || v == "true"); ++i; }
     else if (a == "--tool-grammar") { g_cfg.tool_grammar = (v == "on" || v == "1" || v == "true"); ++i; }
+    else if (a == "--thinking-grammar") { g_cfg.thinking_grammar = (v == "on" || v == "1" || v == "true"); ++i; }
     else if (a == "--embeddings") { g_cfg.embeddings = (v == "on" || v == "1" || v == "true"); ++i; }
     else if (a == "--params-file") { g_cfg.params_file = v; ++i; }
     else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }

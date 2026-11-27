@@ -246,6 +246,38 @@ runtime 的 `n_decode_tokens` 和请求上限差一个（实测 `max_new_tokens=
 推论：`--thinking-effort-inject`、`reasoning_effort` 这类"改 system 文本"的开关，只有在 `on` 模式下
 才可能真正落到模型看到的 token 序列上。
 
+### 4.3 "只思考不作答"，以及用 grammar 修它的尝试（结论：不成立）
+
+现象：思考开着时，模型有时不写 `</think>` 就直接选 EOS。这时答案通道是空的，服务端只能把整段按思考内容
+放进 `reasoning_content`，`content` 返回空串。对 Agent 客户端来说，这是一条既没有正文也没有工具调用的轮次。
+这个行为到现在还在："1+1 等于几？只回答数字。"（`temperature 0`、`max_tokens 48`）→ `content` 0 字符、
+`reasoning_content` 228 字符。不是生成预算造成的：同一条 prompt 在 900 / 不限制 / 2500 三种预算下输出逐字节相同
+（§4.1 也量过）。
+
+试过的修法：按官方 SDK 的写法下发一份 structural_tag，要求"任意思考文本 → </think> → 自由回答"。
+官方形式是 `sequence[ tag(begin 空, content any_text, end </think>), 分隔, 最终格式 ]`，
+见《RKNN3 SDK 开发指南》"thinking 内容 → thinking 结束/切换标记 → 最终答案"那一节。
+服务端开关是 `--thinking-grammar on|off`，请求级可用 `chat_template_kwargs.thinking_grammar` 覆盖。
+
+实测结论：这条约束管不到思考段。四个观察（同一服务实例、`temperature 0`，贪心可复现；前三条可以用
+`tools/thinking_grammar_probe.py` 重跑）：
+
+| 观察 | 结果 |
+|---|---|
+| fib 题，grammar on 与 grammar off | 逐字节相同：157 token、276 字符纯思考，然后 EOS，`content` 空 |
+| grammar 要求的结束标记换成无意义的 `ZZZCLOSE` | 模型不认，照旧写它自己的 `</think>`，整段输出里没有出现 `ZZZCLOSE` |
+| fib 题 + 硬性 JSON 约束（`json_schema` 要求 `code` 字段） | 还是 157 token 纯思考后 EOS，没有 JSON |
+| 城市/温度那道 JSON 题 + `json_object` | 正常输出 `</think>` + 合法 JSON，服务端日志里能看到 `rknn3_grammar_accept_callback: AcceptToken rejected token_id=1` |
+
+最后一行说明 grammar 引擎是活的（它确实会屏蔽 EOS），但它只约束"最终格式"那一段；思考段的前缀不被匹配，
+在思考段里模型仍然可以选 EOS。所以末元素不管是官方的 `any_text`，还是退一步写成"至少输出一个字符"的正则，
+都等于没有约束。
+现在这个开关默认关着（`--thinking-grammar off`），代码和开关留着，等新的固件或运行时再试。
+
+眼下真正可用的两个办法：按任务关思考（`reasoning_effort:"none"`，效果见 §4.1），或者客户端收到空 `content`
+且没有 `tool_calls` 时自己重试一次。服务端没有做自动重试——那会让一次请求变成两次生成，
+时长和 KV 槽位的行为都要重新设计，属于未决项。
+
 ## 5. 常驻服务
 
 `deploy/install_service.sh` 会装好并 enable 这一套（unit 模板里的 `__PREFIX__` 会替换成实际前缀，默认 `/opt/rk1828-spark`）：
@@ -282,6 +314,9 @@ journalctl -u rk1828-spark -f
   一段"已调用工具查询到…"的叙述，Agent 侧要自己校验。命中率最终由模型本身的工具遵循度决定。
 - `response_format` 走 runtime grammar（`json_object` → BUILTIN_JSON，`json_schema` → JSON_SCHEMA）。
   未知类型返回 400；思考模式下用 `structural_tag` 把思考段和约束段合成一份 grammar。
+- **grammar 只约束"最终格式"那一段，约束不了思考段**：思考开着时模型仍然可以在思考通道里直接选 EOS，
+  服务端只能回一条空 `content`。现象、尝试过程和证据见 §4.3 —— 这是模型与 1.2.0 运行时叠加出来的限制，
+  不是服务端加个开关能绕过的。
 - 流式响应不能在同一条连接上 keep-alive（没有 Content-Length，只能靠关连接收尾）。
 - 长上下文 prefill 实测：38,006 token 用 72.0 s，53,166 token 用 115.6 s，都成功且 needle 能召回。
   逐级加压时每次复查卡状态都正常。早期"长 prefill 打挂"的记录发生在旧固件 + 没接 12 V 供电时，
