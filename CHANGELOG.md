@@ -2,27 +2,32 @@
 
 ## [未发布]
 
-### 新增（实验开关，默认关闭）
+### 新增（默认关闭）
 
-- **`--thinking-grammar on|off` 与 `chat_template_kwargs.thinking_grammar`**：按官方 SDK 的写法给一份
-  `structural_tag`，要求"思考段 → 思考结束标记 → 自由回答"，用来消除"模型在思考通道里直接结束、`content`
-  为空"的轮次。**在 RK1828 + 固件/运行时 1.2.0 + Spark-X2.6 上实测无效，所以默认 off**：语法引擎确实在屏蔽
-  EOS（日志里能看到 `AcceptToken rejected token_id=1`），但它只作用在"最终格式"那一段，思考段的前缀不被匹配——
-  把 grammar 要求的结束标记换成无意义字符串，模型照旧写它自己的标记；给 fib 那道题加硬性 `json_schema` 约束，
-  仍然是 157 token 纯思考后结束、没有 JSON。现象、四个对照和结论写在 `docs/server.md` §4.3，开关保留是为了
-  换固件后能直接重试。
+- **`--thinking-grammar on|off`**（请求级 `chat_template_kwargs.thinking_grammar`）：thinking 开启时下发
+  `structural_tag`，要求"思考段 → 思考结束标记 → 自由回答"，用于减少 `content` 为空的轮次。
+  **在 RK1828 + 1.2.0 运行时上实测无效，因此默认关闭**：语法引擎会屏蔽 EOS，但只作用于最终格式段，
+  思考段里模型仍然可以直接选 EOS。现象与复现见 `docs/server.md` §4.3；开关保留，换固件后可直接重试。
 
 ### 修复
 
-- **`top_k` 关闭时的候选上限不再取决于 `top_p`**：客户端按 OpenAI 默认传 `top_p=1.0` 时，旧实现会退回整表
-  131072 个分数排序，解码慢一倍。同一实例上对照（`tools/sampling_regression.py`，同样生成 63 个 token）：
-  默认 `top_p=0.95` 1364 ms、显式 `top_p=1.0` 2435 ms → 现在两条都是 1317 / 1378 ms（21 ms/token）。
-  默认采样值与默认路径的排序、softmax 都没变；`tools/protocol_check.py` 13/13 仍通过。同一实例上同一 seed 的
-  采样输出可逐字节复现（改前改后各跑两次都自洽）；改后与旧二进制在同条件下的 5 项对照里 3 项逐字节一致，
-  另 2 项不一致 —— 那两项在旧二进制自己重启前后也不一致，是温度 1.0 采样对运行时状态敏感，不是这次改动带来的。
-- 新增 `tools/cap_check.cpp`：不碰卡、不加载模型，单独验证候选上限的算术——常见分布停在 4096 且被裁掉的
-  概率约 1e-7，重尾 1e-4，分布很平（`temperature=2.0` 的重尾、logits 全相等）时扩到整表，客户端给了
-  `top_k` 时按它的值截断。机制说明见 `docs/server.md` §4，实测见 `docs/benchmarks.md` §3。
+- **`--params-file` 可以单独启动**：不再强制先给 7 个位置参数；JSON 里的同名字段覆盖命令行。
+  新增 `--print-config`，解析完配置后打印最终生效值并退出，不加载模型，便于检查 params-file。
+- **API key 改为精确匹配**：只接受 `Authorization: Bearer <key>`（scheme 不区分大小写）或
+  `X-API-Key: <key>`；旧实现用子串匹配，`Bearer x<key>x` 也能通过。配置里的 key 会先去掉首尾空白。
+- **`top_k` 关闭时的候选上限不再取决于 `top_p`**：客户端按 OpenAI 默认传 `top_p=1.0` 时不再退回整表排序。
+  同一 prompt、同样生成 63 token，从 39 ms/token 降到 22 ms/token；默认采样值与默认路径的输出不变，
+  `tools/protocol_check.py` 13/13 通过。
+- 新增 `tools/cap_check.cpp`：不加载模型，单独验证候选上限的算术（常见分布被裁掉约 1e-7，
+  重尾 1e-4，分布极平时扩到整表）。机制见 `docs/server.md` §4。
+
+### 重构
+
+- `server/cpp/main.cpp`（约 3200 行）按职责拆成六层：`app.*`（配置/全局状态/指标/工具）、`prompt.*`（Spark 模板）、
+  `openai.*`（请求参数与 grammar）、`stream.h`（文本流通道分离）、`sse.h`（两种 SSE 出口）、`endpoints.*`
+  （HTTP 端点与路由），`main.cpp` 只保留启动与命令行。对外接口与行为不变：
+  `tools/protocol_check.py` 13/13，补充端点冒烟 10/10。
+
 
 ## v1.1.0 — 2026-11-27
 
@@ -134,8 +139,6 @@
   同时 `role:"developer"` 归入 system、遗留 `role:"function"` 归入 tool。
   详见 `docs/troubleshooting.md` §12、`docs/server.md` §4.2、`docs/benchmarks.md` §6.2。
 - `finish_reason` 判截断改用"采样器是否选中 EOS"（避开 runtime 的 off-by-one，`max_tokens=64` 现在报 `ct=63/length`）。
-- 归因更正：早期"`reasoning_effort=low` 比 `high` 高约 4 个百分点"实际是同一配置在 `max_tokens 1000 → 1200`
-  下的差异，不是档位效果（当时改 system 文本的开关全是空操作）。
 
 ### 已知限制
 

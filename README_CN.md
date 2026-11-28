@@ -81,7 +81,7 @@ KV 槽位需要一块内存盘。`deploy/start.sh` 会检查 `KV_SLOT_DIR`：如
 ## 目录结构
 
 ```
-server/          自研推理服务（C++11）：engine 推理引擎、httpd HTTP/SSE、main OpenAI 协议 + 运维端点
+server/          自研推理服务（C++11）：engine 推理引擎、httpd HTTP/SSE、prompt/openai/stream/sse 协议层、endpoints 路由、kvslots KV 分页
 convert/         转换流水线：export_rknn.py、run_conversion.sh、校准集构建、GRQ 精度自检
 deploy/          systemd 单元、启动脚本、健康守护、安装脚本、env 样例
 tools/           评测、压测、复读专项、长上下文、协议验收脚本

@@ -46,7 +46,6 @@ struct SlotState {
 struct SlotPlan {
   int slot = -1;               // 选用的槽（<0 = 未启用槽位）
   int prefix_tokens = 0;       // 卡上已缓存、本次可以直接复用的前缀 token 数
-  size_t text_offset = 0;      // （保留）文本偏移；实际发送串见 send_text
   std::string send_text;       // 命中时本次要送给 runtime 的文本（截断后的提示词尾巴 + 新的一轮）
   bool reused = false;         // 是否命中并沿用了已有 KV
   bool loaded = false;         // 是否做了 存旧镜像 + 装新镜像

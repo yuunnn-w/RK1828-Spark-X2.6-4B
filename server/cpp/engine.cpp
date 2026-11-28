@@ -675,8 +675,8 @@ int Engine::sample_token(const float16* logits, int V) {
   if (cand.empty()) {
     return -1;
   }
-  // 候选规模：客户端给了 top_k 就按它；top_k 关闭（官方 top_k=-1）时用实现上限 CAP，与 top_p 取值无关。
-  // 旧写法只在 top_p<1 时裁剪，客户端按 OpenAI 默认传 top_p=1.0 就退化成整表 13 万次排序。
+  // 候选规模：客户端给了 top_k 就按它；top_k 关闭（官方 top_k=-1）时用实现上限 CAP，与 top_p 取值无关
+  // （否则客户端按 OpenAI 默认传 top_p=1.0 时会退化成整表排序）。
   const int CAP = 4096;
   int k = m_req.top_k > 0 ? std::min((int)cand.size(), m_req.top_k) : std::min((int)cand.size(), CAP);
   float t = m_req.temperature;
@@ -957,7 +957,6 @@ int Engine::cb_result(void* ud, RKLLMResult* result, LLMCallState state) {
   if (piece.empty()) {
     return 0;
   }
-  size_t prev_len = e->m_out.size();
   e->m_out += piece;
   e->note_text(piece);
 
@@ -1294,7 +1293,6 @@ int Engine::generate(const GenRequest& req, GenResult& out, TextSink* sink) {
   if (out.prompt_tokens < n_prefill + n_reuse) {
     out.prompt_tokens = n_prefill + n_reuse;
   }
-  out.prompt_text_tokens = out.prompt_tokens;
 
   long ft = m_first_token_t ? m_first_token_t : t1;
   out.prefill_ms = (double)(ft - m_t0) / 1000.0;

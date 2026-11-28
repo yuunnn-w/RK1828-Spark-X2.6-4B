@@ -3,7 +3,6 @@ server/build/
 .sdk/
 .model-zoo/
 *.o
-*.a.tmp
 
 # 模型与转换中间产物（都很大，别进 git）
 model/*.rknn
@@ -33,7 +32,3 @@ venv*/
 .DS_Store
 .idea/
 .vscode/
-
-# 测试产物
-results/*
-!results/.gitkeep

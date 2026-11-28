@@ -23,14 +23,15 @@ struct TextSink {
 struct GenRequest {
   std::string system_prompt;   // 完整的 system 块（含 Spark 控制标记）
   std::string prompt_prefix;   // 用户轮起始标记
-  std::string prompt_postfix;  // 生成引导（<think> 或 ）
+  std::string prompt_postfix;  // 生成引导（思考开标签或思考闭标签）
   std::string text;            // 本轮文本（多轮历史已串在里面）
 
-  int   max_new_tokens = 512;
-  float temperature = 0.0f;
-  int   top_k = 1;
-  float top_p = 1.0f;
-  float repeat_penalty = 1.05f;
+  // 缺省值与服务端生产默认一致；各端点都会用 apply_gen_params 覆盖，这里只保证单独使用时行为合理
+  int   max_new_tokens = 0;
+  float temperature = 1.0f;
+  int   top_k = 0;
+  float top_p = 0.95f;
+  float repeat_penalty = 1.0f;
   float frequency_penalty = 0.0f;
   float presence_penalty = 0.0f;
   long  seed = -1;
@@ -69,8 +70,7 @@ struct TokenProb {
 
 struct GenResult {
   std::string text;
-  long prompt_tokens = 0;        // runtime 报告的本次 prefill token 数（不含复用部分）
-  long prompt_text_tokens = 0;   // 整段 prompt 的真实 token 数（含复用部分）
+  long prompt_tokens = 0;        // runtime 报告的本次 prefill token 数（含复用部分）
   long reused_tokens = 0;        // runtime 从卡上 KV 复用的 token 数
   long completion_tokens = 0;
   double prefill_ms = 0.0;

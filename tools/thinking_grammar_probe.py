@@ -10,7 +10,7 @@
 
 结论（1.2.0 运行时 + Spark-X2.6，见 docs/server.md 4.3）：1 和 2 逐字节相同，都在思考段里选 EOS、
 content 为空；3 也没有 JSON —— grammar 只约束最终格式那段，约束不了思考段。
-要复现第 4 个观察（把 grammar 要求的结束标记改成无意义字符串，模型不认）需要改 server/cpp/main.cpp
+要复现第 4 个观察（把 grammar 要求的结束标记改成无意义字符串，模型不认）需要改 openai.cpp
 里 build_runtime_grammar 的 t["end"] 再编译。
 """
 import argparse

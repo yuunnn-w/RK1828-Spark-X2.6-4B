@@ -86,7 +86,7 @@ KV slots need a RAM disk. `deploy/start.sh` checks `KV_SLOT_DIR`: if it is not a
 ## Repository layout
 
 ```
-server/          the server (C++11): engine, httpd, main, kvslots
+server/          the server (C++11): engine, httpd, prompt/openai/stream/sse protocol layers, endpoints, kvslots
 convert/         conversion pipeline: export_rknn.py, run_conversion.sh, calibration builder, GRQ check
 deploy/          systemd units, start wrapper, health watchdog, installer, env sample
 tools/           eval, stress, repetition, long-context and protocol checks

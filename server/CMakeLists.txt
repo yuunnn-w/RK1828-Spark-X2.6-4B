@@ -58,6 +58,10 @@ add_subdirectory(thirdparty/utils)
 
 add_executable(rknn_spark_server
     cpp/main.cpp
+    cpp/app.cpp
+    cpp/prompt.cpp
+    cpp/openai.cpp
+    cpp/endpoints.cpp
     cpp/engine.cpp
     cpp/httpd.cpp
     cpp/kvslots.cpp

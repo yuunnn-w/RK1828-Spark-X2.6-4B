@@ -23,6 +23,18 @@
 
 static long ms_since(long us) { return (long)((getCurrentTimeUs() - us) / 1000); }
 
+// 丢掉一个槽的会话状态（不动镜像文件与计时统计）
+static void clear_state(SlotState& s) {
+  s.prompt_text.clear();
+  s.gen_text.clear();
+  s.kv_text.clear();
+  s.prompt_tokens = 0;
+  s.gen_tokens = 0;
+  s.kv_tokens = 0;
+  s.ids.clear();
+  s.resident = false;
+}
+
 void KvSlots::configure(int max_slots, const std::string& dir, int min_prefix, long max_image_bytes,
                         long max_total_bytes) {
   std::lock_guard<std::mutex> lk(m_mu);
@@ -231,7 +243,6 @@ SlotPlan KvSlots::acquire(Engine& eng, const std::string& prompt_text) {
         ok = false;
       } else {
         plan.prefix_tokens = (int)(best->kv_tokens > 0 ? best->kv_tokens : best->prompt_tokens);
-        plan.text_offset = best->kv_text.size();
         plan.send_text = prompt_text.substr(best->kv_text.size());
       }
     }
@@ -250,12 +261,7 @@ SlotPlan KvSlots::acquire(Engine& eng, const std::string& prompt_text) {
     }
     // 命中但镜像/续接失败：退化成冷启动，别把坏状态留在槽里
     drop_image(*best);
-    best->prompt_text.clear();
-    best->gen_text.clear();
-    best->kv_text.clear();
-    best->prompt_tokens = 0;
-    best->kv_tokens = 0;
-    best->resident = false;
+    clear_state(*best);
     if (resident == best) {
       resident = NULL;
     }
@@ -271,13 +277,7 @@ SlotPlan KvSlots::acquire(Engine& eng, const std::string& prompt_text) {
     return plan;
   }
   drop_image(*target);
-  target->prompt_text.clear();
-  target->gen_text.clear();
-  target->kv_text.clear();
-  target->prompt_tokens = 0;
-  target->gen_tokens = 0;
-  target->kv_tokens = 0;
-  target->ids.clear();
+  clear_state(*target);
   target->hits = 0;
   target->last_used = time(NULL);
   for (size_t i = 0; i < m_slots.size(); ++i) {
@@ -285,7 +285,6 @@ SlotPlan KvSlots::acquire(Engine& eng, const std::string& prompt_text) {
   }
   plan.slot = target->id;
   plan.prefix_tokens = 0;  // 冷启动：引擎会清 KV
-  plan.text_offset = 0;
   LOGK("slot %d cold start (%d slots configured)", target->id, m_max);
   return plan;
 }
@@ -343,14 +342,7 @@ void KvSlots::reset(Engine& eng) {
   bool any = false;
   for (size_t i = 0; i < m_slots.size(); ++i) {
     any = any || m_slots[i].resident;
-    m_slots[i].prompt_text.clear();
-    m_slots[i].gen_text.clear();
-    m_slots[i].kv_text.clear();
-    m_slots[i].prompt_tokens = 0;
-    m_slots[i].gen_tokens = 0;
-    m_slots[i].kv_tokens = 0;
-    m_slots[i].ids.clear();
-    m_slots[i].resident = false;
+    clear_state(m_slots[i]);
     m_slots[i].hits = 0;
     drop_image(m_slots[i]);
   }

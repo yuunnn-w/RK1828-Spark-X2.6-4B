@@ -77,28 +77,18 @@
 - **"换 KV cache 运行时策略能提速"** —— 默认 / `--kvcache-policy 0`(RECURRENT) / `1`(NORMAL) 三档差异在噪声内；
   `--kvcache-policy 0 --kv-n-keep 2048` 直接起不来（HEALTH_FAIL）。
 
-### 客户端传 `top_p=1.0` 时曾经过慢一倍（已修）
+### 候选上限（`top_k` 关闭时）
 
-服务端对 `top_k` 关闭时的候选上限原来只在 `top_p<1` 时生效，客户端按 OpenAI 默认传 `top_p=1.0` 就退回
-整表 131072 个分数排序。同一 prompt、同样生成 63 个 token，同一服务实例上对照（`tools/sampling_regression.py`）：
-
-| 路径 | 改前 | 改后 |
-|---|---|---|
-| 默认 `top_p=0.95` | 1364 ms（21.7 ms/token，46 tok/s） | 1317 ms（20.9 ms/token，48 tok/s） |
-| 显式 `top_p=1.0` | 2435 ms（38.7 ms/token，26 tok/s） | 1378 ms（21.9 ms/token，46 tok/s） |
-
-改的只是候选规模的条件，默认采样值和默认路径的排序、softmax 都没动。被裁掉的概率有多大由
-`tools/cap_check.cpp` 单独验证：常见分布 1e-7 量级，重尾 1e-4，分布很平时扩到整表（等价于不裁剪）。
-机制写在 `docs/server.md` §4。
+`top_k` 关闭时只对分数最高的 4096 个候选排序，与 `top_p` 取值无关；整表是 131072 个分数，
+排序量差 32 倍。同一 prompt 生成 63 token 的实测是 21–22 ms/token，默认 `top_p=0.95` 与显式
+`top_p=1.0` 落在同一水平。上限的算术由 `tools/cap_check.cpp` 单独验证（不加载模型），机制写在 `docs/server.md` §4。
 
 ## 4. 复读与熔断
 
-- **对抗性专项**（`tools/repeat_probe.py`，24 组 prompt × thinking on/off × temp 0/0.8 = 48 组）。
-  修复 system 送达路径之后那一轮是 runaway **4/48**，全部来自 `字母表` 和 `循环填空` 两组（各跑 temp 0/0.8）。
-  这四条的 prompt 本身就是"把字母表 / 填空循环重复下去"，模型只是在服从指令；它们都在几十 token 内
-  自然 `stop`，熔断也介入了（veto 1、7）。修复前那一轮是 2/48，同样是这两类 case。
-  趋势：12/48（没有 n-gram 熔断）→ 8/48（加了 token 级 n-gram）→ 2–4/48（剩下的全是 prompt 明确要求重复的，
-  本来就不该被熔断打断）。
+- **对抗性专项**（`tools/repeat_probe.py`，24 组 prompt × thinking on/off × temp 0/0.8 = 48 组）：
+  runaway **4/48**，全部来自"字母表"和"循环填空"两组（各跑 temp 0/0.8）。这四条的 prompt 本身就是
+  "把字母表 / 填空循环重复下去"，模型只是在服从指令；它们都在几十 token 内自然 `stop`，熔断也介入了
+  （veto 1、7）。其余 44 组没有失控。
 - **重放专项**（`tools/loop_replay.py`，从评测里挑疑似复读/被截断的样本重放）：
   25 条 → 熔断触发 4、**全部在撞上限之前自然收尾**、最大 degen 0.47。
 - 熔断三层（默认开启）：token 级周期检测（周期 ≤400 的三连块）、token 级 8-gram 计数、
@@ -132,11 +122,6 @@ HEAD `/health`、`/v1/models/{id}`、未知 id 404、`n>1` → 400、reasoning �
 
 → 命中 **2/6**。`thinking on` 对"只输出代码"这类短任务是负资产，对数学/推理题是正资产（§6.2）。
 
-⚠️ 修复 system 送达路径之前这张表的数字是 155/74，而且 MISS 的回答里带一句
-"并且系统提示 `thinking_effort=high`，需要在思考通道中体现高程度的思考"。**那句复述不是注入文本被抄出来的**，
-而是模型当时根本看不到预期的 system 块，把训练分布里的话凭空补写了出来。修复后这句消失、回答变短（155→88），
-但结论方向不变。
-
 ### 6.2 system 块到底进不进模型（`--system-in-prompt`）
 
 同一批 60 题（每领域 10 题）、`temperature 0`、`max_tokens 1200`、同一判分函数、同一个服务实例（`tools/eval_llm.py`）：
@@ -147,9 +132,6 @@ HEAD `/health`、`/v1/models/{id}`、未知 id 404、`n>1` → 400、reasoning �
 | 同上 + `thinking off` | 8/50 = 16.0 % | 609 | 30451 | 237 | 13 | 2/50 | 0 |
 | `--system-in-prompt on` + 注入 off | 10/50 = 20.0 % | 680 | 33982 | 293 | 18 | 8/50 | 0 |
 | `--system-in-prompt on` + 注入 on（现默认） | 12/50 = 24.0 % | 833 | 41648 | 344 | 18 | 13/50 | 0 |
-
-（`off` 那一行与更早两轮 `cfgab_low` / `cfgab_noinj` **逐字节相同**（连 ct 合计 29814 都一样），当同一配置看。
-那两轮曾被误读成"`reasoning_effort=low` 更准"——其实当时"改 system 文本"的开关全是空操作。）
 
 读数：
 

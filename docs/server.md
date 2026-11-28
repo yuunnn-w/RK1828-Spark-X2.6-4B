@@ -16,7 +16,21 @@ OpenAI 兼容的 HTTP 接口，常驻运行。
 同一份模型走 model-zoo 的 C++ demo 就正常。本服务就是把那条可用路径做成常驻 + HTTP。
 证据见 `docs/troubleshooting.md` 第 4 条。
 
-- 源码：`server/cpp/{engine.h,engine.cpp,httpd.h,httpd.cpp,main.cpp,kvslots.h,kvslots.cpp}`
+源码按职责分层（`server/cpp/`，C++11）：
+
+| 文件 | 职责 |
+|---|---|
+| `main.cpp` | 命令行、引擎与槽位初始化、信号处理与退出 |
+| `app.h` / `app.cpp` | 全局配置、进程指标、FIFO 闸门、通用小工具、Spark 标记 |
+| `prompt.h` / `prompt.cpp` | Spark 对话模板与工具说明组装 |
+| `openai.h` / `openai.cpp` | 请求参数与 runtime grammar |
+| `stream.h` | 模型文本流的通道分离与工具调用增量 |
+| `sse.h` | SSE 出口（chat.completion.chunk 与 Responses API 事件） |
+| `endpoints.h` / `endpoints.cpp` | HTTP 端点与路由 |
+| `engine.h` / `engine.cpp` | RKNN3 session 封装（加载、采样、KV 控制） |
+| `httpd.h` / `httpd.cpp` | HTTP/1.1 服务层（keep-alive、超时、SSE） |
+| `kvslots.h` / `kvslots.cpp` | 多会话 KV 镜像分页 |
+
 - 编译：`scripts/build_server.sh`，产物 `server/build/rknn_spark_server`
 - 部署：`deploy/install_service.sh`，默认前缀 `/opt/rk1828-spark`
 
@@ -62,10 +76,22 @@ env TMPDIR=/run/rknn3 /opt/rk1828-spark/bin/rknn_spark_server \
 
 模型加载大约 45 s，期间 `/health` 返回 503，加载完变 200。`TMPDIR` 必须可写，systemd 单元里已经设好。
 
-另外两种配置方式：
+两种启动方式：
 
-- JSON 配置文件（和官方 rkllm3-server 风格一致）：`--params-file params.json`
-- 鉴权：`--api-key K`，之后客户端要带 `Authorization: Bearer K`（`/health` 除外）
+- **位置参数**：`<llm.rknn> <llm.weight> <core_mask> <tokenizer.gguf> <embed.bin> <max_context_len> <rope.safetensors>`，后面跟选项；
+- **JSON 配置**：`--params-file params.json`，可以单独使用（不必再给 7 个位置参数），同名字段会覆盖命令行。
+  它覆盖 `host/port/api-key/timeout/max-connections`、`kv-slots/kv-slot-dir`，以及 `models.<name>` 下的
+  `model/weight/vocab/embed/rope-tensor/alias/ctx-size/core-mask/predict/temp/top-k/top-p/惩罚/thinking`；
+  KV 预算、流式工具、grammar 等其余参数仍用命令行。
+
+`--print-config` 解析完配置后打印最终生效值并退出，不加载模型、不碰卡；用它检查 params-file 是否写对：
+
+```bash
+rknn_spark_server --params-file params.json --print-config
+```
+
+鉴权：`--api-key K` 打开后，客户端要带 `Authorization: Bearer K` 或 `X-API-Key: K`
+（scheme 不区分大小写，key 必须完全一致；`/health`、`/healthz` 除外）。
 
 完整参数列表：`rknn_spark_server --help`。
 
@@ -78,8 +104,7 @@ KV 槽位的镜像放在内存盘里。`deploy/start.sh` 会检查 `KV_SLOT_DIR`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | 主接口，参数见下方列表；`n>1` 返回 400 |
-| `POST` | `/v1/completions` | 传统补全。`prompt` 原样送进模型，不做 chat 包装，适合评测和底层实验 |
+| `POST` | `/v1/chat/completions` | 主接口，参数见下方列表；`n>1` 返回 400 || `POST` | `/v1/completions` | 传统补全。`prompt` 原样送进模型，不做 chat 包装，适合评测和底层实验 |
 | `POST` | `/v1/responses` | OpenAI Responses API（流式 + 非流式）。`instructions`、`input`（字符串或 item 数组）、扁平 `tools`、`tool_choice`、`max_output_tokens`、`reasoning.effort`、`text.format` |
 | `POST` | `/v1/embeddings` | 词嵌入表均值池化 + L2 归一化（本模型 2560 维）。只是近似嵌入，不是训练过的 embedding 模型 |
 | `GET` | `/v1/models`, `/v1/models/{id}` | 模型列表。`properties.context_length`、`capabilities`、`supported_parameters`，`meta` 里有量化方式和 KV 槽位配置 |
@@ -184,9 +209,7 @@ runtime 的 `n_decode_tokens` 和请求上限差一个（实测 `max_new_tokens=
 （`temperature=2.0` 的重尾、或 logits 几乎相等）才会扩到整表。客户端自己给了 `top_k` 就按它的值截断，不扩大。
 
 为什么要有上限：整表是 131072 个分数，排序加 softmax 每个 token 都要做一遍，只看前 4096 个把排序量缩小 32 倍。
-早期的条件是"`top_k` 关闭并且 `top_p<1`"，于是客户端按 OpenAI 默认传 `top_p=1.0` 就退回整表路径：同样生成
-63 个 token 用 1.36 s 变 2.45 s（21 ms/token 变 39 ms/token）。条件改成与 `top_p` 无关后，两条路径都是
-约 21 ms/token。
+上限与 `top_p` 取值无关，显式传 `top_p=1.0` 也走同一条路径，实测约 21–22 ms/token。
 
 复读防线只做"熔断"，不做逐 token 惩罚（默认 `--sampler custom`）：
 
@@ -248,35 +271,25 @@ runtime 的 `n_decode_tokens` 和请求上限差一个（实测 `max_new_tokens=
 
 ### 4.3 "只思考不作答"，以及用 grammar 修它的尝试（结论：不成立）
 
-现象：思考开着时，模型有时不写 `</think>` 就直接选 EOS。这时答案通道是空的，服务端只能把整段按思考内容
+现象：思考开着时，模型有时不写思考结束标记就直接选 EOS。这时答案通道是空的，服务端只能把整段按思考内容
 放进 `reasoning_content`，`content` 返回空串。对 Agent 客户端来说，这是一条既没有正文也没有工具调用的轮次。
-这个行为到现在还在："1+1 等于几？只回答数字。"（`temperature 0`、`max_tokens 48`）→ `content` 0 字符、
-`reasoning_content` 228 字符。不是生成预算造成的：同一条 prompt 在 900 / 不限制 / 2500 三种预算下输出逐字节相同
-（§4.1 也量过）。
+这个行为和生成预算无关："1+1 等于几？只回答数字。"（`temperature 0`）在 `max_tokens=48` 时就给出空
+`content`；放宽到 900 / 不限制 / 2500，输出逐字节相同，说明不是预算不够。
 
-试过的修法：按官方 SDK 的写法下发一份 structural_tag，要求"任意思考文本 → </think> → 自由回答"。
-官方形式是 `sequence[ tag(begin 空, content any_text, end </think>), 分隔, 最终格式 ]`，
+试过的修法：thinking 开启时下发 `structural_tag`，要求"任意思考文本 → 思考结束标记 → 自由回答"。
+官方形式是 `sequence[ tag(begin 空, content any_text, end 思考结束标记), 分隔, 最终格式 ]`，
 见《RKNN3 SDK 开发指南》"thinking 内容 → thinking 结束/切换标记 → 最终答案"那一节。
 服务端开关是 `--thinking-grammar on|off`，请求级可用 `chat_template_kwargs.thinking_grammar` 覆盖。
 
-实测结论：这条约束管不到思考段。四个观察（同一服务实例、`temperature 0`，贪心可复现；前三条可以用
-`tools/thinking_grammar_probe.py` 重跑）：
+实测结论：这条约束管不到思考段。语法引擎确实会屏蔽 EOS（服务端日志里能看到
+`rknn3_grammar_accept_callback: AcceptToken rejected token_id=1`），但只作用于最终格式段；
+给 fib 题再加硬性 `json_schema` 约束，结果仍然是一段纯思考后 EOS、没有 JSON。
+前三个对照可以用 `tools/thinking_grammar_probe.py` 重跑；把 grammar 要求的结束标记换成无意义字符串
+（模型不认、照旧写自己的标记）需要改 `openai.cpp` 里的 `build_runtime_grammar` 再编译。
 
-| 观察 | 结果 |
-|---|---|
-| fib 题，grammar on 与 grammar off | 逐字节相同：157 token、276 字符纯思考，然后 EOS，`content` 空 |
-| grammar 要求的结束标记换成无意义的 `ZZZCLOSE` | 模型不认，照旧写它自己的 `</think>`，整段输出里没有出现 `ZZZCLOSE` |
-| fib 题 + 硬性 JSON 约束（`json_schema` 要求 `code` 字段） | 还是 157 token 纯思考后 EOS，没有 JSON |
-| 城市/温度那道 JSON 题 + `json_object` | 正常输出 `</think>` + 合法 JSON，服务端日志里能看到 `rknn3_grammar_accept_callback: AcceptToken rejected token_id=1` |
-
-最后一行说明 grammar 引擎是活的（它确实会屏蔽 EOS），但它只约束"最终格式"那一段；思考段的前缀不被匹配，
-在思考段里模型仍然可以选 EOS。所以末元素不管是官方的 `any_text`，还是退一步写成"至少输出一个字符"的正则，
-都等于没有约束。
-现在这个开关默认关着（`--thinking-grammar off`），代码和开关留着，等新的固件或运行时再试。
-
-眼下真正可用的两个办法：按任务关思考（`reasoning_effort:"none"`，效果见 §4.1），或者客户端收到空 `content`
-且没有 `tool_calls` 时自己重试一次。服务端没有做自动重试——那会让一次请求变成两次生成，
-时长和 KV 槽位的行为都要重新设计，属于未决项。
+所以这个开关默认关闭，代码留着等新的固件或运行时。眼下可用的两个办法：按任务关思考
+（`reasoning_effort:"none"`，效果见 §4.1），或者客户端收到空 `content` 且没有 `tool_calls` 时自己重试一次。
+服务端没有做自动重试——那会让一次请求变成两次生成，时长和 KV 槽位的行为都要重新设计，属于未决项。
 
 ## 5. 常驻服务
 
@@ -299,8 +312,8 @@ journalctl -u rk1828-spark -f
 
 ## 6. 已知限制
 
-- **单 session，请求串行**：模型 KV 已占 4854/5052 MB，所有推理请求排队执行。并发只体现在 HTTP 层
-  和排队上（超过 `--max-queue` 返回 429，`/stats` 有 `queued_now` / `queue_limit`）。
+- **单 session，请求串行**：模型常驻约 4903/5120 MB（权重 2.37 GiB + KV + 内部缓冲），所有推理请求排队执行。
+  并发只体现在 HTTP 层和排队上（超过 `--max-queue` 返回 429，`/stats` 有 `queued_now` / `queue_limit`）。
   4 个 KV 槽位解决的是会话切换时的重复 prefill，不是并行推理。
 - **`n>1` 直接拒绝**（400）。已实现：`logit_bias`、`top_logprobs`（1..8）、`reasoning_effort`、`logprobs`、
   `/v1/completions`、HEAD、`/v1/models/{id}`、429 + `Retry-After`、`/v1/responses`、`/v1/embeddings`
@@ -319,12 +332,11 @@ journalctl -u rk1828-spark -f
   不是服务端加个开关能绕过的。
 - 流式响应不能在同一条连接上 keep-alive（没有 Content-Length，只能靠关连接收尾）。
 - 长上下文 prefill 实测：38,006 token 用 72.0 s，53,166 token 用 115.6 s，都成功且 needle 能召回。
-  逐级加压时每次复查卡状态都正常。早期"长 prefill 打挂"的记录发生在旧固件 + 没接 12 V 供电时，
-  不要据此自我设限，但仍建议阶梯加压、每级检查卡状态。
+  加压时建议一级一级往上试，每级复查卡状态（`rknn-smi info` 的 `Online/OK` 与空闲内存）。
 
 ## 7. 长上下文 Agent / 编码的推荐配置
 
-生产配置在 `/etc/rknn3-llm.env`（改完 `systemctl restart rknn3-llm.service`）：
+生产配置在 `/etc/rk1828-spark.env`（改完 `systemctl restart rk1828-spark.service`）：
 
 | 项 | 值 | 理由 |
 |---|---|---|

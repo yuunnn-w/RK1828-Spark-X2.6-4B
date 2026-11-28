@@ -48,6 +48,14 @@ static void set_sock_timeout(int fd, int send_sec, int recv_sec) {
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+// 所有 JSON / 状态响应用的 CORS 头（SSE 单独一套）
+static std::string cors_headers() {
+  return "Access-Control-Allow-Origin: *\r\n"
+         "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n"
+         "Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n"
+         "Access-Control-Max-Age: 86400\r\n";
+}
+
 class SocketWriter : public ResponseWriter {
  public:
   SocketWriter(int fd, bool keep_alive) : m_fd(fd), m_keep_alive(keep_alive) {}
@@ -72,10 +80,7 @@ class SocketWriter : public ResponseWriter {
     std::string h = "HTTP/1.1 " + std::to_string(status) + " " + status_text(status) + "\r\n";
     h += "Content-Type: " + ctype + "\r\n";
     h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    h += "Access-Control-Allow-Origin: *\r\n";
-    h += "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n";
-    h += "Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n";
-    h += "Access-Control-Max-Age: 86400\r\n";
+    h += cors_headers();
     if (status == 429) {
       h += "Retry-After: 2\r\n";
     } else if (status == 503) {
@@ -92,10 +97,7 @@ class SocketWriter : public ResponseWriter {
   void write_status_only(int status, const std::string& ctype) override {
     std::string h = "HTTP/1.1 " + std::to_string(status) + " " + status_text(status) + "\r\n";
     h += "Content-Type: " + ctype + "\r\n";
-    h += "Access-Control-Allow-Origin: *\r\n";
-    h += "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n";
-    h += "Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n";
-    h += "Access-Control-Max-Age: 86400\r\n";
+    h += cors_headers();
     h += m_keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     h += "\r\n";
     write_raw(h.data(), h.size());
@@ -223,7 +225,8 @@ void HttpServer::accept_loop() {
       std::string r = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: " +
                       std::to_string(strlen(body)) + "\r\nConnection: close\r\n\r\n";
       r += body;
-      write(cfd, r.data(), r.size());
+      ssize_t sent = write(cfd, r.data(), r.size());
+      (void)sent;
       close(cfd);
       continue;
     }
@@ -345,7 +348,8 @@ void HttpServer::handle_conn(int fd, const std::string& peer) {
     }
     if (req.headers.count("expect") && lower_str(req.headers["expect"]).find("100-continue") != std::string::npos) {
       static const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
-      write(fd, cont, strlen(cont));
+      ssize_t sent = write(fd, cont, strlen(cont));
+      (void)sent;
     }
     if (chunked) {
       // RFC 7230 分块传输：size 行（可带 ;ext）→ 数据 → CRLF，0 块后跟 trailer
